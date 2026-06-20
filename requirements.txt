@@ -1,0 +1,8 @@
+gymnasium==0.29.1
+pygame==2.6.1
+stable-baselines3==2.2.1
+torch
+numpy==1.26.2
+tensorboard==2.15.1
+matplotlib==3.8.2
+pillow

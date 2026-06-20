@@ -11,6 +11,7 @@ TUI beroperasi sepenuhnya via _keyboard_, menampilkan 5 menu utama:
 3. **[Output Prefix]:** Input teks murni untuk prefix (Preview: `[prefix]_[algo]_level[X].zip`). Didukung fitur _Auto-Increment_ jika nama _file_ mengalami duplikasi.
 4. **[Level Select]:** Level 1 hingga 5.
 5. **[Parallelization]:** Kontrol utilitas CPU _core_ (1 hingga 8).
+6. **[Episode]:** Jumlah episode pelatihan.
 
 ## Mode Pelatihan & Resolusi Logika
 
@@ -34,6 +35,7 @@ Untuk mencegah _fatal exception_ pada _Display Server_ OS akibat _multiprocessin
 [Output Prefix] [prefix]*[algo]\_level[X].zip
 [Level Select] 1 <-> 5
 [Parallelization] 1 <-> 8 Check available CPU cores
+[Episode] 0
 
 [Start Training] (Press Enter)
 

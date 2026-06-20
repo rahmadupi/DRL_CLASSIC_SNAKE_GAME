@@ -1,6 +1,6 @@
 # ARCHITECTURE & EXPERIMENT DESIGN
 
-Proyek ini membandingkan dua arsitektur algoritmik yang dipisahkan di direktori `src/models/`.
+Proyek ini membandingkan dua arsitektur algoritmik yang dipisahkan di direktori `game/models/`.
 
 ## 1. Proposed Model: Spatiotemporal PPO
 
@@ -21,14 +21,56 @@ Algoritma DQN menggunakan arsitektur _Dense Layer_ (MLP) murni. Menerima input d
 
 ## Konfigurasi Reward
 
-* **Reward Positif:** +1 untuk setiap makanan yang dimakan.
+Sistem reward ini dirancang untuk memberikan sinyal belajar yang kaya (_reward shaping_) dengan memanfaatkan jarak Euclidean terhadap target terdekat.
 
-* **Reward Negatif:** -1 untuk setiap tabrakan (dinding atau tubuh sendiri).
+### Reward Events
 
-* **Reward Waktu:** -0.01 per langkah untuk mendorong efisiensi
+| Event                          | Reward | Deskripsi                       |
+| ------------------------------ | ------ | ------------------------------- |
+| Bergerak **mendekati** makanan | +1.0   | Menghargai efisien pendekatan   |
+| Bergerak **menjauhi** makanan  | -0.5   | Menghukum gerakan membingungkan |
+| Memakan makanan statis         | +10    | Reward utama untuk menang       |
+| Memakan makanan dinamis        | +8     | Reward utama untuk menang       |
+| Tabrakan (dinding/tubuh)       | -10    | Punishment fatal                |
+| Time penalty                   | -0.001 | Tekanan minimal untuk efisiensi |
 
+### Implementasi Pseudo-code
 
+```python
+def calculate_reward(old_head, new_head, food_eaten, collision):
+    reward = 0
 
+    # 1. Distance-based reward shaping
+    old_dist = euclidean(old_head, nearest_food)
+    new_dist = euclidean(new_head, nearest_food)
+    if new_dist < old_dist:
+        reward += 1.0   # Moved closer
+    else:
+        reward -= 0.5   # Moved away
+
+    # 2. Food eaten
+    if food_eaten == "static":
+        reward += 10
+    elif food_eaten == "dynamic":
+        reward += 8
+
+    # 3. Collision penalty
+    if collision:
+        reward -= 10
+
+    # 4. Time efficiency
+    reward -= 0.001
+
+    return reward
+```
+
+### Desain Rationale
+
+- **Distance reward (+1.0/-0.5):** Memberikan sinyal kontinu setiap step, mempercepat konvergensi dibanding reward sparce.
+- **Food reward (+10):** Skala besar untuk memperkuat goal utama.
+- **Collision penalty (-10):** Cukup besar untuk diajarkan avoidance, tapi tidak overpower dibanding food reward.
+- **Time penalty (-0.001):** Minimal agar tidak terlalu menghukum gerakan aman di late-game.
+- **Balancing:** Makanan Dinamis diberi reward sedikit lebih rendah untuk mencerminkan tantangan tambahan, mendorong strategi yang lebih adaptif. karena target dinamis mungkin membawa risiko lebih tinggi untuk mengejar.
 
 ### PPO Architecture Diagram
 

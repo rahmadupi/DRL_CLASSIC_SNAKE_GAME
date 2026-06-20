@@ -27,12 +27,12 @@ root/
 │   ├── __init__.py
 │   ├── envs/
 │   │   ├── __init__.py
-│   │   └── snake_env.py        # Kelas AdvancedSnakeEnv (Outlet: Tensor 4-Kanal & 12-bit)
+│   │   └── game_environment.py        # Kelas AdvancedSnakeEnv (Outlet: Tensor 4-Kanal & 12-bit)
 │   │
 │   ├── models/
 │   │   ├── __init__.py
-│   │   ├── spatiotemporal.py   # Kelas SpatiotemporalExtractor (Proposed PPO)
-│   │   └── dqn_paper.py        # Kelas Sequential MLP 12-bit (Baseline Paper)
+│   │   ├── ppo_spatiotemporal.py   # Kelas SpatiotemporalExtractor (Proposed PPO)
+│   │   └── dqn_12bit.py        # Kelas Sequential MLP 12-bit (Baseline Paper)
 │   │
 │   └── train/                  # Modul Shared Resource untuk Eksekusi Pelatihan
 │       ├── __init__.py

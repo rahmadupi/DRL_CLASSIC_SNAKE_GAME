@@ -1,0 +1,88 @@
+{
+  "_comment": "Central configuration for the Snake game env package. Edit values here, not in the .py files.",
+
+  "DEFAULT_FPS": 10,
+  "DEFAULT_CELL_SIZE": 50,
+  "DEFAULT_WALL_THICKNESS": 8,
+
+  "GRID_SIZE": 20,
+  "INITIAL_SNAKE_LENGTH": 3,
+
+  "ACTION_UP": 0,
+  "ACTION_RIGHT": 1,
+  "ACTION_DOWN": 2,
+  "ACTION_LEFT": 3,
+
+  "DIRECTIONS": {
+    "UP": [-1, 0],
+    "RIGHT": [0, 1],
+    "DOWN": [1, 0],
+    "LEFT": [0, -1]
+  },
+
+  "DYNAMIC_PENALTY": false,
+  "REWARD_APPROACH": 1.0,
+  "REWARD_AWAY": -0.5,
+  "REWARD_EAT_STATIC": 10.0,
+  "REWARD_EAT_DYNAMIC": 9.0,
+  "REWARD_COLLISION": -10.0,
+  "REWARD_TIME": -0.001,
+  "REWARD_MOD": [0.005, 0.004, 0.0025],
+  "REWARD_MOD_CAP": [1.5, 1.0, 1.0],
+
+  "LEVEL_CONFIG": {
+    "1": { "static": 1, "dynamic": 0 },
+    "2": { "static": 4, "dynamic": 0 },
+    "3": { "static": 0, "dynamic": 1 },
+    "4": { "static": 0, "dynamic": 4 },
+    "5": { "static": 3, "dynamic": 2 }
+  },
+
+  "EVASION_PROB": 0.2,
+  "MOMENTUM_MIN": 3,
+  "MOMENTUM_MAX": 8,
+
+  "LAUNCHER_WIDTH": 640,
+  "LAUNCHER_HEIGHT": 640,
+  "FPS_MIN": 1,
+  "FPS_MAX": 60,
+  "FPS_DEFAULT": 10,
+
+  "UI": {
+    "BORDER_WIDTH": 4,
+    "SHADOW_OFFSET": 0,
+    "ITEM_HEIGHT": 56,
+    "ITEM_GAP": 12,
+    "BUTTON_MIN_WIDTH": 120,
+    "MODAL_WIDTH_RATIO": 0.47,
+    "MODAL_HEIGHT_RATIO": 0.3,
+    "TITLE_FONT_SIZE": 30,
+    "ITEM_FONT_SIZE": 15,
+    "BUTTON_FONT_SIZE": 15,
+    "BODY_FONT_SIZE": 15,
+    "PALETTE": {
+      "BLACK": [0, 0, 0],
+      "WHITE": [255, 255, 255],
+      "BG_CREAM": [255, 247, 217],
+      "YELLOW": [255, 220, 0],
+      "PINK": [255, 90, 180],
+      "LIME": [180, 255, 80],
+      "CYAN": [100, 220, 255],
+      "CORAL": [255, 120, 80],
+      "PANEL_FILL": [255, 247, 217],
+      "DIM": [0, 0, 0]
+    }
+  },
+
+  "COLORS": {
+    "WALL": [0, 0, 0],
+    "BG_BASE": [255, 247, 217],
+    "BG_CHECKER": [240, 232, 202],
+    "SNAKE_HEAD": [80, 160, 255],
+    "SNAKE_BODY": [40, 90, 180],
+    "STATIC_FOOD": [50, 220, 80],
+    "DYNAMIC_FOOD": [230, 50, 50],
+    "WALL_HIGHLIGHT": [100, 100, 100],
+    "SCORE": [20, 40, 120]
+  }
+}
