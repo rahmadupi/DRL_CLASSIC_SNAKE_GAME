@@ -51,6 +51,33 @@ from game.train.utility import (
     preview_name,
     SAVED_MODELS_DIR,
 )
+from game.model.configs import (
+    obs_type_token,
+    obs_type_from_token,
+    OBS_TYPE_TO_TOKEN,
+    TOKEN_TO_OBS_TYPE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Allowed obs types per algorithm (used by the modal picker + cycling)
+# ---------------------------------------------------------------------------
+# PPO and DQN share the same set of obs_type options (both algorithms
+# support both 12-bit and spatiotemporal). "spatiotemporal_legacy" is
+# offered in the modal picker only — it's a backward-compat hatch for
+# loading old 4-channel models and shouldn't be the default for new
+# runs.
+_OBS_TYPE_CYCLE = {
+    # Algorithm → ordered list of obs types used by ←/→ cycling.
+    # The first entry is the algorithm's default obs_type.
+    "ppo": ["spatiotemporal", "12bit"],
+    "dqn": ["12bit", "spatiotemporal"],
+}
+_OBS_TYPE_PICKER_ITEMS = [
+    "spatiotemporal (8x20x20)",
+    "12bit (12-dim vector)",
+    "spatiotemporal_legacy (4x20x20, compat)",
+]   # labels are kept short to fit the centered 50-char modal
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +105,8 @@ CONTAINER_WIDTH = 50                       # width (chars) of the centered optio
 @dataclass
 class TrainConfig:
     algorithm: str = "PPO"                  # "PPO" | "DQN"
+    obs_type: str = "spatiotemporal"        # "spatiotemporal" | "12bit"
+                                            # | "spatiotemporal_legacy"
     existing_model: Optional[str] = None    # path to .zip or None (new)
     output_prefix: str = "snake"
     level: int = 1
@@ -113,12 +142,46 @@ def _short_filename(path: Optional[str]) -> str:
     return os.path.basename(path)
 
 
+def _obs_type_display(obs_type: str) -> str:
+    """Render ``obs_type`` for the TUI row.
+
+    Maps the long obs_type names to compact labels that fit in the
+    centered 50-char value column. The token shown in parentheses is
+    the same one that gets embedded in the saved filename — making
+    the mapping explicit saves the user from guessing what
+    "spatiotemporal" turns into inside ``saved_models/``.
+    """
+    labels = {
+        "spatiotemporal":        "spatiotemporal (sptmp)",
+        "12bit":                 "12bit (12bit)",
+        "spatiotemporal_legacy": "spatiotemporal_legacy (sptmp_lgcy)",
+    }
+    return labels.get(obs_type, obs_type)
+
+
 # Matches the convention enforced by `game.train.utility.auto_naming`:
-#     <prefix>_<algo>_level<L>[_<n>].zip     e.g. snake_ppo_level1.zip
+#     <prefix>_<algo>[_<obstype>]_level<L>[_<n>].zip
+# e.g. snake_ppo_sptmp_level1.zip, myrun_dqn_12bit_level3_2.zip
+# The obs_type token is OPTIONAL — pre-existing models saved before the
+# naming change still match the legacy pattern (no obs token).
 # Used to filter the model picker by algorithm and to detect when a
 # user has selected a model whose algorithm no longer matches the
 # currently chosen algorithm (a PPO zip selected under DQN, etc.).
-_ALGO_FROM_NAME = re.compile(r"_(ppo|dqn)_level\d+", re.IGNORECASE)
+_ALGO_FROM_NAME = re.compile(
+    r"_(?P<algo>ppo|dqn)"
+    r"(?:_(?P<obstype>12bit|sptmp_lgcy|sptmp))?"
+    r"_level\d+",
+    re.IGNORECASE,
+)
+
+# Extracts only the obs_type token (or None) from a model filename.
+# Mirrors the optional group in ``_ALGO_FROM_NAME`` so the picker
+# can filter on obs_type too (e.g. don't offer a sptmp PPO model when
+# the user has selected the 12bit variant).
+_OBS_FROM_NAME = re.compile(
+    r"_(?:ppo|dqn)_(?P<obstype>12bit|sptmp_lgcy|sptmp)(?:_level\d+|$)",
+    re.IGNORECASE,
+)
 
 
 def _algo_from_filename(path: str) -> Optional[str]:
@@ -135,7 +198,25 @@ def _algo_from_filename(path: str) -> Optional[str]:
     m = _ALGO_FROM_NAME.search(name)
     if not m:
         return None
-    return m.group(1).upper()
+    return m.group("algo").upper()
+
+
+def _obs_type_from_filename(path: str) -> Optional[str]:
+    """
+    Extract the obs_type token from a saved-model filename.
+
+    Returns the long obs_type name (e.g. ``"spatiotemporal"``,
+    ``"12bit"``, ``"spatiotemporal_legacy"``) or ``None`` if the
+    filename doesn't embed one (legacy naming convention). ``None``
+    is treated as "unknown / backward-compat" — the loader falls
+    back to the SB3 ``observation_space.shape`` lookup in
+    :mod:`game.env.input_controller` when this returns ``None``.
+    """
+    name = os.path.basename(path)
+    m = _OBS_FROM_NAME.search(name)
+    if not m:
+        return None
+    return obs_type_from_token(m.group("obstype"))
 
 
 def _filter_models_for_algo(
@@ -152,17 +233,41 @@ def _filter_models_for_algo(
     return [p for p in model_paths if _algo_from_filename(p) == target]
 
 
+def _filter_models_for_obs_type(
+    model_paths: List[str], obs_type: str
+) -> List[str]:
+    """
+    Keep only models whose filename advertises ``obs_type``.
+
+    Files with no obs_type token in the filename (legacy naming) are
+    silently dropped — the picker filters by EXACT obs type, so an
+    ambiguous file shouldn't appear in the list and risk an incorrect
+    resume. The launcher's SB3-metadata fallback in
+    :meth:`game.env.input_controller.load_model` still works for
+    legacy files when the user manually selects them through other
+    means.
+    """
+    return [p for p in model_paths if _obs_type_from_filename(p) == obs_type]
+
+
 def _drop_mismatched_model(cfg: TrainConfig) -> None:
     """
     Clear :attr:`TrainConfig.existing_model` if it doesn't match the
-    currently selected algorithm. Call this after every algorithm change
-    so the displayed selection stays valid (avoids the silent state
-    where a PPO zip is still "selected" while the user is configuring
-    a DQN run).
+    currently selected algorithm OR obs_type. Call this after every
+    algorithm / obs_type change so the displayed selection stays
+    valid (avoids the silent state where a PPO sptmp zip is still
+    "selected" while the user is configuring a DQN 12-bit run).
     """
     if cfg.existing_model is None:
         return
     if _algo_from_filename(cfg.existing_model) != cfg.algorithm:
+        cfg.existing_model = None
+        return
+    # Only enforce obs_type match when the filename actually advertises
+    # one — legacy files (no obs token) are passed through and the
+    # loader's SB3-metadata fallback decides.
+    file_obs = _obs_type_from_filename(cfg.existing_model)
+    if file_obs is not None and file_obs != cfg.obs_type:
         cfg.existing_model = None
 
 
@@ -329,6 +434,7 @@ def _modal_text_input(stdscr, title: str, initial: str = "") -> Optional[str]:
 # Row order MUST match the indices below.
 ROWS: List[str] = [
     "algorithm",
+    "obs_type",
     "existing_model",
     "output_prefix",
     "level",
@@ -350,6 +456,7 @@ def _render(stdscr, cfg: TrainConfig, focus: int) -> None:
     # ---- Left column: option labels --------------------------------------
     labels = [
         ("Algorithm",       f"{cfg.algorithm}"),
+        ("Obs Type",        _obs_type_display(cfg.obs_type)),
         ("Existing Model",  _short_filename(cfg.existing_model)),
         ("Output Prefix",   cfg.output_prefix or "<empty>"),
         ("Level Select",    f"{cfg.level}"),
@@ -358,11 +465,14 @@ def _render(stdscr, cfg: TrainConfig, focus: int) -> None:
         ("Start Training",  ""),
     ]
 
-    # Preview row (under the form, computed on-the-fly)
+    # Preview row (under the form, computed on-the-fly). Includes the
+    # obs_type token so the user can see the final filename shape
+    # (e.g. "snake_ppo_12bit_level1.zip").
     preview_stem, preview_path = preview_name(
         prefix=cfg.output_prefix or "model",
         algo=cfg.algorithm.lower(),
         level=cfg.level,
+        obs_type=cfg.obs_type,
     )
     preview_line = f"Preview → {preview_stem}.zip"
 
@@ -415,16 +525,44 @@ def _activate_row(
         _drop_mismatched_model(cfg)
         return False
 
+    if row == "obs_type":
+        # Modal picker offers the full set of supported obs types;
+        # the cycling handled by ←/→ covers the two "primary" options
+        # (12bit / spatiotemporal) which is what the user changes most
+        # often. ``spatiotemporal_legacy`` is a backward-compat hatch
+        # for loading 4-channel models — best surfaced via the modal.
+        options = ["spatiotemporal", "12bit", "spatiotemporal_legacy"]
+        labels = _OBS_TYPE_PICKER_ITEMS
+        # Pre-select the currently active option so the user can
+        # confirm with Enter without re-navigating.
+        try:
+            initial = options.index(cfg.obs_type)
+        except ValueError:
+            initial = 0
+        chosen = _modal_pick(stdscr, "Select Obs Type", labels, initial=initial)
+        if chosen is None:
+            return False
+        cfg.obs_type = options[chosen]
+        # An existing model selected earlier may no longer match the
+        # new obs_type; clear it so the form stays consistent.
+        _drop_mismatched_model(cfg)
+        return False
+
     if row == "existing_model":
-        # Only show models whose filename matches the active algorithm.
-        # This prevents the user from selecting, say, a PPO zip while
-        # DQN is the active algorithm (which would crash inside
-        # DQN.load with an opaque features-extractor error).
-        compatible = _filter_models_for_algo(model_paths, cfg.algorithm)
+        # Only show models whose filename matches BOTH the active
+        # algorithm AND the active obs_type. Resuming a PPO sptmp
+        # zip under DQN 12-bit would crash inside SB3's loader with
+        # an opaque features-extractor error, and resuming across
+        # obs_types (same algo) would silently feed the wrong shape
+        # into ``model.predict()``.
+        compatible = _filter_models_for_obs_type(
+            _filter_models_for_algo(model_paths, cfg.algorithm),
+            cfg.obs_type,
+        )
         items = ["<New Model>"] + [_short_filename(p) for p in compatible]
-        title = f"Select {cfg.algorithm} Model"
+        title = f"Select {cfg.algorithm} {cfg.obs_type} Model"
         if len(compatible) == 0:
-            items.append(f"<no saved {cfg.algorithm} models>")
+            items.append(f"<no saved {cfg.algorithm} {cfg.obs_type} models>")
         chosen = _modal_pick(stdscr, title, items, initial=0)
         if chosen is None:
             return False
@@ -490,6 +628,19 @@ def _adjust_value(cfg: TrainConfig, focus: int, delta: int) -> None:
         # Same compat-hygiene as the Enter handler: drop the selection
         # if its filename no longer matches the new algorithm.
         _drop_mismatched_model(cfg)
+    elif row == "obs_type":
+        # Cycle through the algorithm's primary obs_type options.
+        # "spatiotemporal_legacy" is intentionally NOT in the cycle —
+        # it's a backward-compat hatch best picked from the modal
+        # picker (Enter on the obs_type row) so the user picks it
+        # deliberately instead of bumping into it on every ←/→ press.
+        cycle = _OBS_TYPE_CYCLE.get(cfg.algorithm, ["spatiotemporal", "12bit"])
+        try:
+            idx = cycle.index(cfg.obs_type)
+        except ValueError:
+            idx = 0
+        cfg.obs_type = cycle[(idx + delta) % len(cycle)]
+        _drop_mismatched_model(cfg)
     elif row == "level":
         cfg.level = max(1, min(5, cfg.level + delta))
     elif row == "parallelization":
@@ -539,6 +690,23 @@ def _launch_training(stdscr, cfg: TrainConfig) -> None:
                 )
                 return
 
+            # Obs-type validation — the picker already filters by
+            # obs_type, but a renamed legacy file (no obs token) could
+            # still slip through. ``_drop_mismatched_model`` only
+            # enforces the match when the filename DOES advertise one,
+            # so this catches files that DO but mismatch.
+            file_obs = _obs_type_from_filename(cfg.existing_model)
+            if file_obs is not None and file_obs != cfg.obs_type:
+                print(
+                    f"\n[ERROR] Selected model's obs_type does not match "
+                    f"the selected obs_type.\n"
+                    f"         File:         {cfg.existing_model}\n"
+                    f"         File obs:     {file_obs}\n"
+                    f"         Selected obs: {cfg.obs_type}\n"
+                    f"         Falling back to the main menu."
+                )
+                return
+
         # Concern #4 — stale-pick guard.
         # The picker snapshot is re-scanned every ~2 s, but a file can
         # still be deleted/moved between the last redraw and the moment
@@ -583,28 +751,37 @@ def _launch_training(stdscr, cfg: TrainConfig) -> None:
         # progress bar's "eps/N" display — propagate it down.
         total_episodes = cfg.episodes if cfg.episodes > 0 else None
 
+        # Common trainer kwargs — pulled out so the PPO / DQN branches
+        # below stay readable. Both trainers now load their default
+        # hyperparameters from the JSON config and accept these kwargs
+        # as overrides on top.
+        common_kwargs = dict(
+            level=cfg.level,
+            obs_type=cfg.obs_type,
+            n_envs=cfg.parallelization_capped(get_cpu_count()),
+            total_timesteps=total_timesteps,
+            total_episodes=total_episodes,
+            output_prefix=cfg.output_prefix or "snake",
+            load_path=cfg.existing_model,
+        )
+
         if cfg.algorithm == "PPO":
             from game.train.ppo_trainer import PPOTrainingConfig, train_ppo
 
-            config = PPOTrainingConfig(
-                level=cfg.level,
-                n_envs=cfg.parallelization_capped(get_cpu_count()),
-                total_timesteps=total_timesteps,
-                total_episodes=total_episodes,
-                output_prefix=cfg.output_prefix or "snake",
-                load_path=cfg.existing_model,
+            config = PPOTrainingConfig.from_json_dict(
+                "ppo",
+                **common_kwargs,
             )
             model, path = train_ppo(config)
         else:
             from game.train.dqn_trainer import DQNTrainingConfig, train_dqn
 
-            config = DQNTrainingConfig(
-                level=cfg.level,
-                n_envs=cfg.parallelization_capped(get_cpu_count()),
-                total_timesteps=total_timesteps,
-                total_episodes=total_episodes,
-                output_prefix=cfg.output_prefix or "snake",
-                load_path=cfg.existing_model,
+            # When resuming, skip the warm-up exploration phase so the
+            # replay buffer starts sampling from the loaded model's
+            # recent experience instead of random exploration.
+            config = DQNTrainingConfig.from_json_dict(
+                "dqn",
+                **common_kwargs,
                 learning_starts=0 if cfg.existing_model else 1_000,
             )
             model, path = train_dqn(config)

@@ -1,0 +1,39 @@
+{
+  "_comment": "Central configuration for PPO trainers (12-bit and spatiotemporal). Edit values here instead of in the trainer .py files. Used by game.train.ppo_trainer via from_json_dict(). Per-run overrides are passed via the TUI (level, obs_type, total_timesteps, etc.).",
+
+  "obs_type": "spatiotemporal",
+
+  "n_envs": 1,
+
+  "total_timesteps": 500000,
+  "learning_rate": 1e-4,
+
+  "n_steps": 2048,
+  "batch_size": 256,
+  "n_epochs": 9,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_range": 0.2,
+  "ent_coef": 0.018,
+  "vf_coef": 0.4,
+  "max_grad_norm": 0.5,
+
+  "use_linear_schedule": true,
+  "lr_end_fraction": 0.1,
+  "clip_end_fraction": 0.05,
+
+  "hidden_dim": 64,
+
+  "cnn_channels": 32,
+  "d_model": 64,
+  "n_heads": 8,
+  "dropout": 0.1,
+  "use_attention": true,
+
+  "net_arch_pi": [64],
+  "net_arch_vf": [64],
+
+  "output_prefix": "snake",
+  "checkpoint_freq": 50000,
+  "seed": null
+}

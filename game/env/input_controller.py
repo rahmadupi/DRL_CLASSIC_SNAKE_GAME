@@ -26,6 +26,29 @@ _ALGO_FILENAME_PATTERNS = {
     "dqn": re.compile(r"(?:^|[_\-\s/.])dqn(?:[_\-\s/.]|$)", re.IGNORECASE),
 }
 
+# Regex patterns for matching obs_type tokens in model filenames.
+# The model's filename embeds one of these short tokens right after
+# the algorithm token — see game/model/configs/__init__.py for the
+# full list of supported obs types and their token mappings. The
+# patterns accept both the canonical token ("12bit", "sptmp",
+# "sptmp_lgcy") and a few human-friendly aliases that show up in
+# hand-named files (e.g. someone named their model `…_spatiotemporal_…`
+# instead of `…_sptmp_…`).
+_OBS_TYPE_FILENAME_PATTERNS = {
+    "12bit": re.compile(
+        r"(?:^|[_\-\s/.])12bit(?:[_\-\s/.]|$)",
+        re.IGNORECASE,
+    ),
+    "spatiotemporal": re.compile(
+        r"(?:^|[_\-\s/.])(?:sptmp|spatiotemporal)(?:[_\-\s/.]|$)",
+        re.IGNORECASE,
+    ),
+    "spatiotemporal_legacy": re.compile(
+        r"(?:^|[_\-\s/.])(?:sptmp_lgcy|sptmp_legacy|spatiotemporal_legacy|spatiotemporal_v1|legacy_sptmp)(?:[_\-\s/.]|$)",
+        re.IGNORECASE,
+    ),
+}
+
 # Stable-Baselines3 writes policy classes as pickled references wrapped in
 # ``{':type:': '<class-string>', ':serialized:': '<base64-pickle>'}``.
 # When unpickled, the class's ``__module__`` tells us which algorithm it
@@ -71,6 +94,37 @@ def _infer_obs_type_from_shape(shape) -> Optional[str]:
     return None
 
 
+def _infer_obs_type_from_filename(zip_path: str) -> Optional[str]:
+    """Map a saved-model filename to the env's ``obs_type`` by regex.
+
+    The filename convention enforced by
+    :func:`game.train.utility.auto_naming` embeds an obs-type token
+    right after the algorithm token::
+
+        <prefix>_<algo>[_<obstype>]_level<L>[_<n>].zip
+                                                │
+                                                └─ obs_type token here
+                                                   (12bit, sptmp, sptmp_lgcy)
+
+    Falls back to ``None`` when the filename doesn't advertise an obs
+    type. This helper is the second-pass fallback used after the SB3
+    ``observation_space.shape`` lookup fails — see
+    :func:`_read_sb3_metadata` for the priority order.
+
+    Note that we deliberately iterate the patterns in a fixed order so
+    that ``spatiotemporal_legacy`` is matched BEFORE ``spatiotemporal``
+    (the longer token is a strict superset of the shorter prefix, so
+    first-match-wins is the only correct ordering).
+    """
+    fname = Path(zip_path).name
+    # Order matters: check the more specific token first so the legacy
+    # variant doesn't get swallowed by the generic spatiotemporal match.
+    for obs_type in ("spatiotemporal_legacy", "12bit", "spatiotemporal"):
+        if _OBS_TYPE_FILENAME_PATTERNS[obs_type].search(fname):
+            return obs_type
+    return None
+
+
 def _read_sb3_metadata(zip_path: str) -> Dict[str, Any]:
     """Read the SB3 ``data`` JSON from a saved model without loading PyTorch.
 
@@ -78,6 +132,9 @@ def _read_sb3_metadata(zip_path: str) -> Dict[str, Any]:
         ``policy_class``  — SB3 class name (e.g. ``"ActorCriticPolicy"``)
         ``obs_shape``     — tuple from ``observation_space["shape"]``
         ``obs_type``      — mapped via :func:`_infer_obs_type_from_shape`
+                            (preferred), falling back to
+                            :func:`_infer_obs_type_from_filename` when the
+                            metadata obs space is missing/undecodable.
         ``algo``          — ``"ppo"`` or ``"dqn"`` or ``None``
     """
     if not zipfile.is_zipfile(zip_path):
@@ -144,11 +201,22 @@ def _read_sb3_metadata(zip_path: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
+    # obs_type resolution: prefer shape-based inference (most reliable),
+    # fall back to filename regex when the shape lookup fails. This
+    # covers the case where the model's ``observation_space`` field is
+    # undecodable but the filename still embeds the obs-type token (see
+    # game/train/utility.py::auto_naming).
+    obs_type: Optional[str] = None
+    if obs_shape is not None:
+        obs_type = _infer_obs_type_from_shape(obs_shape)
+    if obs_type is None:
+        obs_type = _infer_obs_type_from_filename(zip_path)
+
     return {
         "algo": algo,
         "policy_class": policy_module,
         "obs_shape": obs_shape,
-        "obs_type": _infer_obs_type_from_shape(obs_shape) if obs_shape else None,
+        "obs_type": obs_type,
     }
 
 

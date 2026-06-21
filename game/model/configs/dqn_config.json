@@ -1,0 +1,40 @@
+{
+  "_comment": "Central configuration for DQN trainers (12-bit and spatiotemporal). Edit values here instead of in the trainer .py files. Used by game.train.dqn_trainer via from_json_dict(). Per-run overrides are passed via the TUI (level, obs_type, total_timesteps, etc.).",
+
+  "obs_type": "12bit",
+
+  "n_envs": 1,
+  "max_n_envs": 4,
+
+  "total_timesteps": 200000,
+  "learning_rate": 5e-4,
+
+  "buffer_size": 100000,
+  "learning_starts": 1000,
+  "batch_size": 64,
+  "gamma": 0.99,
+  "tau": 1.0,
+  "train_freq": 4,
+  "gradient_steps": 1,
+  "target_update_interval": 1000,
+
+  "use_linear_schedule": true,
+  "lr_end_fraction": 0.0,
+
+  "exploration_fraction": 0.1,
+  "exploration_initial_eps": 1.0,
+  "exploration_final_eps": 0.05,
+
+  "hidden_dim": 64,
+  "features_dim": 64,
+
+  "cnn_channels": 32,
+  "d_model": 64,
+  "n_heads": 8,
+  "dropout": 0.0,
+  "use_attention": true,
+
+  "output_prefix": "snake",
+  "checkpoint_freq": 50000,
+  "seed": null
+}

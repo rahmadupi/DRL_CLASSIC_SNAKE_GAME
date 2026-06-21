@@ -6,13 +6,13 @@ Neubrutal-style main menu for the Snake game.
 
 Flow:
     MENU  →  (Play / Watch AI)  →  LEVELS  →  FPS_MODAL  →  PLAYING
-                                                              │
-                                                          (death)
-                                                              ▼
-                                                        DEATH_MODAL
-                                                              │
-                                                     ┌────────┴────────┐
-                                                  Retry            Main Menu
+                                          ┌──────────────┴──────────────┐
+                                       (death)                        (win: 20×20 filled)
+                                          ▼                                ▼
+                                    DEATH_MODAL                       WIN_MODAL
+                                          │                                │
+                                 ┌────────┴────────┐              ┌────────┴────────┐
+                              Retry           Main Menu       Play Again       Main Menu
 
 Run:
     python game_launcher.py
@@ -68,6 +68,7 @@ class State(Enum):
     FPS_MODAL = "fps_modal"
     PLAYING = "playing"
     DEATH_MODAL = "death_modal"
+    WIN_MODAL = "win_modal"
     RETURN_MODAL = "return_modal"
     QUIT = "quit"
 
@@ -149,6 +150,16 @@ class Launcher:
         self.retry_button: Optional[Button] = None
         self.menu_button: Optional[Button] = None
 
+        # Win modal — shown when the snake fills the entire grid
+        # (``reason="win"`` from the env, only possible at level 1 with
+        # 1 static food after the agent has lengthened to 400 cells).
+        # Two buttons: "Play Again" resets the env on the SAME level;
+        # "Main Menu" tears down and returns to the level picker.
+        self.win_modal: Optional[Modal] = None
+        self.win_score: int = 0
+        self.win_retry_button: Optional[Button] = None
+        self.win_menu_button: Optional[Button] = None
+
         # Pause / return-to-menu modal (triggered by R during PLAYING)
         self.return_modal: Optional[Modal] = None
         self.continue_button: Optional[Button] = None
@@ -178,6 +189,8 @@ class Launcher:
                 self._run_playing()
             elif self.state == State.DEATH_MODAL:
                 self._run_death_modal()
+            elif self.state == State.WIN_MODAL:
+                self._run_win_modal()
             elif self.state == State.RETURN_MODAL:
                 self._run_return_modal()
         pygame.quit()
@@ -659,9 +672,14 @@ class Launcher:
                     if self.controller.game_started:
                         obs, reward, term, trunc, info = self.env.step(action)
                         if term or trunc:
-                            self.death_score = len(self.env.snake) - 3
-                            self.death_reason = info.get("reason", "collision")
-                            self.state = State.DEATH_MODAL
+                            reason = info.get("reason", "collision")
+                            if reason == "win":
+                                self.win_score = len(self.env.snake) - 3
+                                self.state = State.WIN_MODAL
+                            else:
+                                self.death_score = len(self.env.snake) - 3
+                                self.death_reason = reason
+                                self.state = State.DEATH_MODAL
                             running = False
                             continue
             else:  # AI mode
@@ -669,9 +687,14 @@ class Launcher:
                 obs, reward, term, trunc, info = self.env.step(action)
                 self._last_obs = obs
                 if term or trunc:
-                    self.death_score = len(self.env.snake) - 3
-                    self.death_reason = info.get("reason", "collision")
-                    self.state = State.DEATH_MODAL
+                    reason = info.get("reason", "collision")
+                    if reason == "win":
+                        self.win_score = len(self.env.snake) - 3
+                        self.state = State.WIN_MODAL
+                    else:
+                        self.death_score = len(self.env.snake) - 3
+                        self.death_reason = reason
+                        self.state = State.DEATH_MODAL
                     running = False
                     continue
             # 2. Draw — game renders to its own surface, then we blit
@@ -924,6 +947,164 @@ class Launcher:
         pygame.display.flip()
 
     def _death_choice(self, choice: str) -> None:
+        if choice == "retry":
+            self.state = State.PLAYING
+        else:
+            self.state = State.MENU
+
+    # ------------------------------------------------------------------
+    # WIN_MODAL  (snake filled the entire grid — terminal success)
+    # ------------------------------------------------------------------
+    def _run_win_modal(self) -> None:
+        """Modal shown when the env returns ``reason="win"``.
+
+        This is only reachable at level 1 where a single static food
+        lets the snake grow until it occupies every cell. The same
+        layout / input handling as the death modal, but with "YOU WIN!"
+        title and a celebratory green accent. Two buttons: "Play Again"
+        resets the env on the current level; "Main Menu" tears down
+        and returns to the level picker.
+        """
+        assert self.renderer_screen is not None
+
+        screen_w, screen_h = self.screen.get_size()
+
+        try:
+            title_surf = render_text_pil("YOU WIN!", font_size=44, color=BLACK)
+            title_w, title_h = title_surf.get_size()
+        except Exception:
+            title_w, title_h = 200, 50
+        try:
+            score_text = f"Final score: {self.win_score}"
+            score_surf = render_text_pil(score_text, font_size=24, color=BLACK)
+            score_w, score_h = score_surf.get_size()
+        except Exception:
+            score_w, score_h = 220, 30
+
+        button_w = BUTTON_MIN_WIDTH + 20
+        button_h = 56
+        pad = 80
+        gap = 10
+        content_w = max(title_w, score_w, 2 * button_w + gap) + 2 * pad
+        content_h = title_h + score_h + button_h + 2 * gap + 1 * pad
+        max_w = int(screen_w * 0.6)
+        max_h = int(screen_h * 0.4)
+        modal_w = max(380, min(content_w, max_w))
+        modal_h = max(220, min(content_h, max_h))
+
+        modal = Modal(
+            (screen_w, screen_h),
+            title="YOU WIN!",
+            fixed_size=(modal_w, modal_h),
+        )
+
+        retry_btn = Button(
+            pygame.Rect(0, 0, button_w, button_h),
+            "Play Again",
+            on_click=lambda: self._win_choice("retry"),
+        )
+        menu_btn = Button(
+            pygame.Rect(0, 0, button_w, button_h),
+            "Main Menu",
+            on_click=lambda: self._win_choice("menu"),
+        )
+        modal_buttons = [retry_btn, menu_btn]
+        selected_btn = 0  # 0 = Play Again, 1 = Main Menu
+
+        button_y = modal.rect.top + 3 * modal.rect.height // 4
+        retry_btn.rect.midright = (modal.rect.centerx - 12, button_y)
+        menu_btn.rect.midleft = (modal.rect.centerx + 12, button_y)
+
+        self.win_modal = modal
+        self.win_retry_button = retry_btn
+        self.win_menu_button = menu_btn
+
+        running = True
+        while running and self.state == State.WIN_MODAL:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.state = State.QUIT
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self._win_choice("menu")
+                        running = False
+                        continue
+                    if event.key in (pygame.K_LEFT,):
+                        selected_btn = (selected_btn - 1) % len(modal_buttons)
+                    elif event.key in (pygame.K_RIGHT,):
+                        selected_btn = (selected_btn + 1) % len(modal_buttons)
+                    elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                        modal_buttons[selected_btn].on_click()
+                        running = False
+                        continue
+                if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
+                                  pygame.MOUSEMOTION):
+                    for child in modal_buttons:
+                        child.handle_event(event)
+                for btn in modal_buttons:
+                    if btn.clicked_this_frame():
+                        running = False
+
+            for i, btn in enumerate(modal_buttons):
+                btn.selected = (i == selected_btn)
+
+            # Re-draw the winning frame behind the modal.
+            if self.env is not None and self.renderer is not None:
+                self.renderer.draw_frame(
+                    self.renderer_screen,
+                    self.env,
+                    game_started=True,
+                )
+            self.screen.fill(BG_CREAM)
+            self.screen.blit(
+                self.renderer_screen,
+                (self.game_offset_x, self.game_offset_y),
+            )
+            self._draw_win_modal_on_screen()
+            self.clock.tick(30)
+
+        if self.state == State.MENU:
+            self._teardown_game()
+        elif self.state == State.PLAYING:
+            self._reset_game()
+
+    def _draw_win_modal_on_screen(self) -> None:
+        """Render the win modal overlay on the LAUNCHER window."""
+        screen = self.screen
+        modal = self.win_modal
+        # Dim the whole screen
+        dim = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 160))
+        screen.blit(dim, (0, 0))
+        # Panel
+        Panel(modal.rect, fill=PANEL_FILL).draw(screen)
+        # Title at 1/4 — celebratory green-tinted black via the existing
+        # BLACK palette (no new colour added; future-proof: drop in a
+        # LIME from the UI palette if a brighter title is wanted).
+        try:
+            t = render_text_pil("YOU WIN!", font_size=44, color=BLACK)
+            title_y = modal.rect.top + modal.rect.height // 4
+            screen.blit(t, t.get_rect(center=(modal.rect.centerx, title_y)))
+        except Exception:
+            pass
+        # Score at vertical center
+        try:
+            s = render_text_pil(
+                f"Final score: {self.win_score}",
+                font_size=24, color=BLACK,
+            )
+            screen.blit(
+                s, s.get_rect(center=(modal.rect.centerx, modal.rect.centery))
+            )
+        except Exception:
+            pass
+        # Buttons at 3/4
+        self.win_retry_button.draw(screen)
+        self.win_menu_button.draw(screen)
+        pygame.display.flip()
+
+    def _win_choice(self, choice: str) -> None:
         if choice == "retry":
             self.state = State.PLAYING
         else:

@@ -146,6 +146,36 @@ STAGNATION_ENABLED = _cfg.STAGNATION_ENABLED
 STAGNATION_THRESHOLD = _cfg.STAGNATION_THRESHOLD
 STAGNATION_PENALTY = _cfg.STAGNATION_PENALTY
 
+# Encircle penalty — per-step cost while the snake's head is inside a
+# closed loop formed by its own body (i.e. unreachable from any
+# non-snake boundary cell without crossing the body). Targets the
+# "approach food but trap self" failure mode that the stagnation
+# penalty alone does NOT catch (distance can still be decreasing while
+# the snake closes the loop around itself). Detection is BFS flood-
+# fill from the first unoccupied corner; O(grid_size²) per step.
+# Orthogonal to stagnation — both can fire simultaneously (rare).
+ENCIRCLE_PENALTY_ENABLED = _cfg.ENCIRCLE_PENALTY_ENABLED
+ENCIRCLE_PENALTY = _cfg.ENCIRCLE_PENALTY
+ENCIRCLE_DETECTION_MODE = _cfg.ENCIRCLE_DETECTION_MODE
+
+# Spawn-proximity curriculum — during the first SPAWN_PROXIMITY_STEPS
+# env steps, food is placed inside the Manhattan ball of radius
+# SPAWN_PROXIMITY_RADIUS cells around the snake's head (only on
+# initial episode placement, not on respawn after eating). This gives
+# the agent a "warm-up" phase where it can reach food in a handful of
+# steps and learn the food-is-good association before it has to
+# navigate a 20×20 grid blind.
+#
+# Counter is per-env (one class-level int shared across instances in
+# the same Python process). Inside SubprocVecEnv each worker has its
+# own process and its own counter, so the warm-up applies per-env —
+# with n_envs=4 and steps=50000 the rollout gets 4×50000 = 200k
+# warm-up transitions in total. Set SPAWN_PROXIMITY_ENABLED=false to
+# disable (default — preserves the original random spawn behaviour).
+SPAWN_PROXIMITY_ENABLED = _cfg.SPAWN_PROXIMITY_ENABLED
+SPAWN_PROXIMITY_RADIUS = _cfg.SPAWN_PROXIMITY_RADIUS
+SPAWN_PROXIMITY_STEPS = _cfg.SPAWN_PROXIMITY_STEPS
+
 # Level configurations (JSON keys are strings → cast back to int)
 LEVEL_CONFIG = {int(k): v for k, v in _cfg.LEVEL_CONFIG.items()}
 
@@ -268,6 +298,17 @@ class game_environment(gym.Env):
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
 
+    # Class-level counter for the spawn-proximity curriculum. Reset to
+    # 0 once at class-definition time; persists across resets within a
+    # single Python process and is incremented once per ``step()`` call.
+    #
+    # In ``SubprocVecEnv`` each worker runs in its own process and
+    # therefore has its own copy of this int — the warm-up window
+    # applies per-env, not globally across the vec-env. With n_envs=4
+    # and ``SPAWN_PROXIMITY_STEPS=50000`` the rollout receives 200k
+    # warm-up transitions in absolute timesteps.
+    _proximity_steps_taken: int = 0
+
     def __init__(
         self,
         level: int = 1,
@@ -371,6 +412,12 @@ class game_environment(gym.Env):
             
         self.steps_taken += 1
         self.step_counter_for_dynamic += 1
+        # Spawn-proximity curriculum gate — increment the per-process
+        # counter once per env step (including terminal/truncating
+        # steps). The next ``reset()`` will consult this counter when
+        # deciding where to place the new episode's initial food. See
+        # ``SPAWN_PROXIMITY_*`` in config.json for the budget window.
+        game_environment._proximity_steps_taken += 1
 
         old_head = self.snake[0]
         new_head = self._apply_action(action)
@@ -479,18 +526,89 @@ class game_environment(gym.Env):
         self.direction_idx = ACTION_RIGHT
 
     def _init_food(self) -> None:
-        """Spawn food based on current level configuration."""
+        """Spawn food based on current level configuration.
+
+        When the spawn-proximity curriculum is active (see
+        ``SPAWN_PROXIMITY_*`` in config.json), initial food cells are
+        drawn from the Manhattan ball of radius ``SPAWN_PROXIMITY_RADIUS``
+        around the head instead of from the whole grid. Respawns after
+        eating always use the global random sampler so the long-tail
+        behaviour is unaffected once the warm-up ends.
+        """
         config = LEVEL_CONFIG[self.level]
         self.static_food = []
         self.dynamic_food = []
 
+        proximity_on = self._proximity_active()
+
         for _ in range(config["static"]):
-            pos = self._random_empty_cell()
+            if proximity_on:
+                pos = self._random_empty_cell_in_radius(SPAWN_PROXIMITY_RADIUS)
+                if pos is None:
+                    # Snake has grown long enough that the radius is
+                    # saturated; fall back to the global sampler so the
+                    # episode still starts cleanly.
+                    pos = self._random_empty_cell()
+            else:
+                pos = self._random_empty_cell()
             self.static_food.append(pos)
 
         for _ in range(config["dynamic"]):
-            pos = self._random_empty_cell()
+            if proximity_on:
+                pos = self._random_empty_cell_in_radius(SPAWN_PROXIMITY_RADIUS)
+                if pos is None:
+                    pos = self._random_empty_cell()
+            else:
+                pos = self._random_empty_cell()
             self.dynamic_food.append(dynamic_food(self.grid_size, pos))
+
+    def _proximity_active(self) -> bool:
+        """Whether the spawn-proximity curriculum is currently in effect.
+
+        True iff the feature is enabled in config AND the class-level
+        step counter is still below the configured window. The counter
+        is shared across instances in the same process (one per worker
+        in ``SubprocVecEnv``), so the window is measured in env steps,
+        not in wall-clock seconds.
+        """
+        return (
+            SPAWN_PROXIMITY_ENABLED
+            and game_environment._proximity_steps_taken < SPAWN_PROXIMITY_STEPS
+        )
+
+    def _random_empty_cell_in_radius(
+        self, radius: int
+    ) -> Optional[Tuple[int, int]]:
+        """Pick a uniformly-random empty cell within Manhattan radius
+        ``radius`` of the snake's head, or ``None`` if no such cell
+        exists.
+
+        "Empty" means not occupied by the snake or any food already
+        placed earlier in this ``_init_food`` call (static and dynamic
+        food positions are added to the occupied set incrementally).
+        Cells outside the grid are filtered out before the candidate
+        list is built.
+        """
+        if radius < 0:
+            return None
+        head_r, head_c = self.snake[0]
+        occupied = set(self.snake) | set(self.static_food)
+        for dfood in self.dynamic_food:
+            occupied.add(dfood.position)
+        candidates = []
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if dr == 0 and dc == 0:
+                    continue  # skip the head cell itself
+                if abs(dr) + abs(dc) > radius:
+                    continue  # outside the Manhattan ball
+                r, c = head_r + dr, head_c + dc
+                if 0 <= r < self.grid_size and 0 <= c < self.grid_size:
+                    if (r, c) not in occupied:
+                        candidates.append((r, c))
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
     def _random_empty_cell(self) -> Tuple[int, int]:
         """Return a random cell not occupied by snake or other food."""
@@ -623,6 +741,73 @@ class game_environment(gym.Env):
             key=lambda p: math.hypot(p[0] - head_r, p[1] - head_c),
         )
 
+    def _is_enclosed(self, head: Tuple[int, int]) -> bool:
+        """Whether ``head`` is trapped inside a closed loop of the snake.
+
+        Algorithm: BFS from the first unoccupied corner cell over the
+        grid, treating every snake cell **except the head** as a wall.
+        If the head is not reached by the BFS, no path exists from
+        outside the snake to the head without crossing another body
+        cell — the head is enclosed and a future collision is
+        mathematically certain (the snake has filled its own reachable
+        region).
+
+        Edge cases:
+            * All four corners occupied by snake — return False
+              (can't safely seed the BFS; this only happens near
+              game-end when the snake has effectively won anyway).
+            * Snake length = 1 — head is the only snake cell, so the
+              BFS trivially reaches it; returns False.
+            * The head's own cell is treated as walkable so the BFS
+              can confirm "yes, the head is reachable from outside".
+              Treating the head as a wall would make EVERY snake
+              report as enclosed (false positive).
+
+        Cost: O(grid_size²) per call. With grid_size=20 that's 400
+        cell visits per step — sub-millisecond. Caching is not worth
+        it because the body's position changes every step (head moves,
+        tail vacates), so enclosure topology can flip at any time.
+        """
+        # Pick the first unoccupied corner as BFS source. The four
+        # corners are tried in a fixed order; on the initial reset the
+        # snake is at the center so (0,0) is always free.
+        source: Optional[Tuple[int, int]] = None
+        for corner in (
+            (0, 0),
+            (0, self.grid_size - 1),
+            (self.grid_size - 1, 0),
+            (self.grid_size - 1, self.grid_size - 1),
+        ):
+            if corner not in self.snake:
+                source = corner
+                break
+        if source is None:
+            # No safe corner to seed from — defer to "not enclosed"
+            # (snake has filled the entire frame, so this is a near-
+            # win state where the penalty would be moot anyway).
+            return False
+
+        # Wall set = body cells excluding the head. Removing the head
+        # lets the BFS reach it if a path exists from outside — the
+        # enclosure test is "head ∉ visited" after BFS completes.
+        walls = set(self.snake)
+        walls.discard(head)
+        visited = {source}
+        queue = deque([source])
+        while queue:
+            r, c = queue.popleft()
+            for dr, dc in DIRECTIONS.values():
+                nr, nc = r + dr, c + dc
+                if (
+                    0 <= nr < self.grid_size
+                    and 0 <= nc < self.grid_size
+                    and (nr, nc) not in visited
+                    and (nr, nc) not in walls
+                ):
+                    visited.add((nr, nc))
+                    queue.append((nr, nc))
+        return head not in visited
+
     # ---------- Reward ----------
 
     def _compute_reward(
@@ -686,6 +871,24 @@ class game_environment(gym.Env):
             and self._no_progress_steps >= self._stagnation_threshold
         ):
             reward += self._stagnation_penalty
+
+        # 6. Encircle penalty — per-step cost while the snake's head is
+        # inside a closed loop of its own body (BFS from outside cannot
+        # reach the head without crossing the snake). Targets the
+        # "approach food but trap self" failure mode: the snake may
+        # still be reducing distance to food while its body is curving
+        # into an inescapable ring, so the stagnation penalty above
+        # does not catch it. Per-step so the agent learns "don't
+        # close the loop" well before the inevitable collision.
+        # Gated by ENCIRCLE_PENALTY_ENABLED and the detection mode
+        # (currently only "flood_fill" — other modes can be added
+        # later as cheaper approximations).
+        if (
+            ENCIRCLE_PENALTY_ENABLED
+            and ENCIRCLE_DETECTION_MODE == "flood_fill"
+            and self._is_enclosed(new_head)
+        ):
+            reward += ENCIRCLE_PENALTY
 
         return reward
 

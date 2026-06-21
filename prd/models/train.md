@@ -1,17 +1,21 @@
 # TRAINING INFRASTRUCTURE & TUI
 
-Modul pelatihan menggunakan pendekatan paralelisasi (_SubprocVecEnv_) dan dioperasikan melalui antarmuka _Terminal User Interface_ (TUI) berbasis `curses` di skrip peluncur utama (`train.py`).
+Modul pelatihan menggunakan pendekatan paralelisasi (_SubprocVecEnv_) dan dioperasikan melalui antarmuka _Terminal User Interface_ (TUI) berbasis `curses` di skrip peluncur utama (`train_launcher.py`).
 
 ## Spesifikasi Antarmuka Curses (State Machine)
 
-TUI beroperasi sepenuhnya via _keyboard_, menampilkan 5 menu utama:
+TUI beroperasi sepenuhnya via _keyboard_, menampilkan **8 menu utama**:
 
-1. **[Algorithm]:** PPO vs DQN (Kiri/Kanan).
-2. **[Existing Model]:** Navigasi vertikal membaca isi direktori `saved_models/*.zip`. Menyertakan opsi `[0] <New Model>`.
-3. **[Output Prefix]:** Input teks murni untuk prefix (Preview: `[prefix]_[algo]_level[X].zip`). Didukung fitur _Auto-Increment_ jika nama _file_ mengalami duplikasi.
-4. **[Level Select]:** Level 1 hingga 5.
-5. **[Parallelization]:** Kontrol utilitas CPU _core_ (1 hingga 8).
-6. **[Episode]:** Jumlah episode pelatihan.
+1. **[Algorithm]:** PPO ↔ DQN (Kiri/Kanan).
+2. **[Obs Type]:** _spatiotemporal_ ↔ _12bit_ (Kiri/Kanan). Tombol Enter membuka _modal picker_ dengan opsi ketiga `spatiotemporal_legacy` (backward-compat untuk model 4-channel lama). Nilai default berbeda per algoritma: PPO default `spatiotemporal`, DQN default `12bit`.
+3. **[Existing Model]:** Navigasi vertikal membaca isi direktori `saved_models/*.zip`. Filter aktif: hanya tampilkan file yang **keduanya** cocok dengan `Algorithm` dan `Obs Type` aktif (regex di `_filter_models_for_algo` dan `_filter_models_for_obs_type`). Menyertakan opsi `[0] <New Model>`.
+4. **[Output Prefix]:** Input teks murni untuk prefix (Preview: `[prefix]_[algo]_[obstype]_level[X].zip` — lihat §Skema Penamaan File). Didukung fitur _Auto-Increment_ jika nama _file_ mengalami duplikasi.
+5. **[Level Select]:** Level 1 hingga 5.
+6. **[Parallelization]:** Kontrol utilitas CPU _core_ (1 hingga 8 untuk PPO; di-cap ke 4 untuk DQN karena _off-policy bias_ — lihat §Algoritma Pemilihan Model).
+7. **[Episode]:** Jumlah episode pelatihan. `0` artinya gunakan `total_timesteps` default dari JSON config.
+8. **[Start Training]:** (Press Enter untuk memicu `_launch_training`).
+
+> **Hubungan Antar Menu**: setiap perubahan pada `Algorithm` atau `Obs Type` memanggil `_drop_mismatched_model()`, yang akan mengosongkan `Existing Model` bila file yang dipilih sudah tidak kompatibel dengan combo baru. Hal yang sama terjadi jika user memilih model lewat picker lalu mengubah combo — picker akan menolak kombinasi yang tidak punya model tersimpan.
 
 ## Mode Pelatihan & Resolusi Logika
 
@@ -22,28 +26,80 @@ Untuk mencegah _fatal exception_ pada _Display Server_ OS akibat _multiprocessin
 
 ## Checkpointing & Monitoring
 
-- Memanfaatkan `CheckpointCallback` untuk menyimpan bobot secara berkala (misal: setiap 50k iterasi), memungkinkan analisis visual _time-lapse_ via `play_game.py`.
-- Metrik performa diekspor ke `logs/tb_logs/` secara _real-time_ untuk analisis di TensorBoard.
+- Memanfaatkan `CheckpointCallback` untuk menyimpan bobot secara berkala (misal: setiap 50k iterasi), memungkinkan analisis visual _time-lapse_ via `game_launcher.py`.
+- Metrik performa diekspor ke `logs/tb_logs/` secara _real-time_ untuk analisis di TensorBoard. Direktori log mengikuti pola penamaan model dengan menyematkan token `obstype` — lihat `prd/models/tensorboard.md § Path TensorBoard` untuk detail.
 
-## UI
+## Skema Penamaan File (versi baru)
 
-[Title]
+Model dan direktori log memakai pola:
 
-[Options]
-[Algorithm] PPO <-> DQN
-[Existing Model] <New Model> / saved*models/\*.zip
-[Output Prefix] [prefix]*[algo]\_level[X].zip
-[Level Select] 1 <-> 5
-[Parallelization] 1 <-> 8 Check available CPU cores
-[Episode] 0
+```
+saved_models/<prefix>_<algo>[_<obstype>]_level<L>[_<n>].zip
+logs/tb_logs/<prefix>_<algo>[_<obstype>]_level<L>[_<n>]/
+```
 
-[Start Training] (Press Enter)
+`<obstype>` adalah **token pendek** yang dipetakan dari nama panjang `obs_type`:
 
-[Guide & Messages]
+| `obs_type` (panjang)    | Token filename | Contoh model                                   |
+| ----------------------- | -------------- | ---------------------------------------------- |
+| `12bit`                 | `12bit`        | `snake_ppo_12bit_level1.zip`                   |
+| `spatiotemporal`        | `sptmp`        | `snake_dqn_sptmp_level2_1.zip`                 |
+| `spatiotemporal_legacy` | `sptmp_lgcy`   | `old_ppo_sptmp_lgcy_level1.zip` (4-channel v1) |
 
-highlight focused option with inverse color. Use arrow keys to navigate and Enter to select.
+Pemetaan token ↔ nama panjang disimpan di `OBS_TYPE_TO_TOKEN` / `TOKEN_TO_OBS_TYPE` pada [`game/model/configs/__init__.py`](../../game/model/configs/__init__.py). Model lama **tanpa** token `<obstype>` (mis. `ext_ppo_level1.zip`, `mmm_dqn_level1.zip`) tetap dimuat — `game_launcher.py` mendeteksi `obs_type` lewat metadata SB3 (`observation_space.shape`) dengan fallback ke regex nama file bila shape lookup gagal. Lihat `game/env/input_controller.py::_infer_obs_type_from_filename` dan `_OBS_TYPE_FILENAME_PATTERNS` untuk regex pattern.
 
-for option if user press Enter: it will display the option list in the middle of the screen, user can navigate using arrow keys and select using Enter. The selected option will be highlighted.
+Regex nama file lengkap (`train_launcher.py::_ALGO_FROM_NAME`):
+
+```regex
+_(?P<algo>ppo|dqn)(?:_(?P<obstype>12bit|sptmp_lgcy|sptmp))?_level\d+
+```
+
+Group `obstype` bersifat _optional_ — model lama tanpa token cocok dengan pola ini karena `(?:_(?P<obstype>...))?` cocok dengan zero-length string.
+
+## UI Mockup
+
+```
+        TRAIN SNAKE AGENT           device=cpu   cpus=8
+
+  ▶[Algorithm]      PPO
+   [Obs Type]       spatiotemporal (sptmp)
+   [Existing Model] <New Model>
+   [Output Prefix]  snake
+   [Level Select]   1
+   [Parallelization] 1 Demo mode
+   [Episode]        0
+   [Start Training]
+
+  Preview → snake_ppo_sptmp_level1.zip
+            /.../saved_models/snake_ppo_sptmp_level1.zip
+
+       ↑/↓ row · ←/→ change · Enter select/edit · q quit
+```
+
+Saat kursor berpindah ke `Obs Type`, `Existing Model` langsung ter-reset bila model yang sedang dipilih tidak cocok dengan obs_type baru. Picker `Existing Model` otomatis memfilter sehingga hanya file yang **keduanya** cocok dengan `Algorithm` dan `Obs Type` yang ditampilkan.
+
+---
+
+## Konfigurasi Hyperparameter via JSON
+
+Hyperparameter default disimpan di dua file JSON di `game/model/configs/`:
+
+- **[`ppo_config.json`](../../game/model/configs/ppo_config.json)** — Default PPO (12bit dan spatiotemporal).
+- **[`dqn_config.json`](../../game/model/configs/dqn_config.json)** — Default DQN (12bit dan spatiotemporal).
+
+Kedua trainer memuat JSON sebagai basis lewat `PPOTrainingConfig.from_json_dict(...)` / `DQNTrainingConfig.from_json_dict(...)`. TUI launcher menambahkan override per-run (level, obs_type, total_timesteps, learning_rate, n_envs, dll.) lewat kwargs — kwargs yang match dengan field dataclass menang atas nilai JSON. Ini menjadikan JSON satu-satunya sumber kebenaran untuk "knob yang jarang diubah", sementara TUI men-override parameter per-run tanpa edit file.
+
+Contoh panggilan:
+
+```python
+config = PPOTrainingConfig.from_json_dict(
+    "ppo",                          # argumen pertama: "ppo" | "dqn" | path | dict
+    level=3,                        # override
+    obs_type="12bit",               # override
+    learning_rate=2e-4,             # override
+    total_timesteps=300_000,        # override
+)
+```
 
 ---
 
@@ -57,20 +113,28 @@ Bagian ini mendokumentasikan _training loop_ yang sudah diimplementasikan pada m
 train_launcher.py  ──Enter on Start──▶  _launch_training()
                                          │
                                          ├─ validate model/algorithm match
+                                         ├─ validate model/obs_type match
                                          ├─ validate file existence
                                          ├─ translate episodes → timesteps
                                          │
-                                         ├─ PPO:  train_ppo(PPOTrainingConfig)
-                                         └─ DQN:  train_dqn(DQNTrainingConfig)
+                                         ├─ PPO:  PPOTrainingConfig.from_json_dict("ppo", ...)
+                                         │         → train_ppo(config)
+                                         │
+                                         └─ DQN:  DQNTrainingConfig.from_json_dict("dqn", ...)
+                                                   → train_dqn(config)
                                                    │
                                                    ├─ make_vec_env (Dummy/Subproc)
                                                    ├─ resolve_logger_dir (TensorBoard)
                                                    ├─ build_ppo / build_dqn
+                                                   │     (pilih features extractor
+                                                   │      berdasarkan obs_type)
                                                    ├─ CheckpointCallback
                                                    ├─ model.learn(total_timesteps=...)
                                                    ├─ env.close()
                                                    └─ auto_naming() → model.save()
 ```
+
+Pemilihan features extractor di `build_ppo`/`build_dqn` adalah `if obs_type == "12bit": <MLP factory> else: <Spatiotemporal factory>` — lihat [game/train/ppo_trainer.py](../../game/train/ppo_trainer.py) dan [game/train/dqn_trainer.py](../../game/train/dqn_trainer.py) untuk detail lengkap.
 
 ### Translasi Episode → Timestep
 
@@ -88,20 +152,22 @@ total_timesteps = max(2_048, cfg.episodes * 2_048) if cfg.episodes > 0 else 200_
 | Field                 | PPO                | DQN                     | Catatan                                                         |
 | --------------------- | ------------------ | ----------------------- | --------------------------------------------------------------- |
 | `level`               | ✅                 | ✅                      | Curriculum level 1–5                                            |
-| `obs_type`            | `"spatiotemporal"` | `"12bit"`               | Flat vector vs. 4×20×20 tensor                                  |
+| `obs_type`            | `"spatiotemporal"` | `"12bit"`               | Bisa juga `"spatiotemporal_legacy"` (4-channel v1)              |
 | `n_envs`              | bebas (1..cpu)     | clamp ke `max_n_envs=4` | DQN di-cap karena _off-policy bias_                             |
 | `total_timesteps`     | default `500_000`  | default `200_000`       | Budget langkah environment                                      |
-| `learning_rate`       | `5e-4` (default)   | `5e-4` (default)        | Default `5e-4`; PRD membandingkan `1e-4` vs `5e-4`              |
+| `learning_rate`       | `1e-3` (default)   | `5e-4` (default)        | Default di JSON; PRD membandingkan `1e-4` vs `5e-4`             |
 | `use_linear_schedule` | ✅ `True`          | ✅ `True`               | Linear decay LR (PPO juga `clip_range`) — lihat §LR Schedule    |
-| `lr_end_fraction`     | `0.0`              | `0.0`                   | LR akhir = `learning_rate × lr_end_fraction`                    |
-| `clip_end_fraction`   | `0.0` (PPO)        | —                       | clip_range akhir = `clip_range × clip_end_fraction` (hanya PPO) |
+| `lr_end_fraction`     | `0.1`              | `0.0`                   | LR akhir = `learning_rate × lr_end_fraction`                    |
+| `clip_end_fraction`   | `0.05` (PPO)       | —                       | clip_range akhir = `clip_range × clip_end_fraction` (hanya PPO) |
 | `checkpoint_freq`     | `50_000`           | `50_000`                | Steps antar checkpoint                                          |
 | `load_path`           | ✅                 | ✅                      | Curriculum / resume                                             |
 
-Field tambahan spesifik algoritma:
+Field tambahan spesifik algoritma (saat ini nilainya di JSON):
 
-- **PPO**: `n_steps=2048`, `batch_size=64`, `n_epochs=10`, `gae_lambda=0.95`, `clip_range=0.2`, `ent_coef=0.01`, `vf_coef=0.5`, `max_grad_norm=0.5`, `cnn_channels=32`, `d_model=64`, `n_heads=4`, `use_attention=True`.
-- **DQN**: `buffer_size=100_000`, `learning_starts=1_000` (0 saat _resume_), `batch_size=64`, `gamma=0.99`, `tau=1.0`, `train_freq=4`, `target_update_interval=1_000`, `exploration_fraction=0.1`, `exploration_initial_eps=1.0`, `exploration_final_eps=0.05`, `hidden_dim=64`, `features_dim=64`.
+- **PPO**: `n_steps=2048`, `batch_size=256`, `n_epochs=9`, `gae_lambda=0.95`, `clip_range=0.2`, `ent_coef=0.018`, `vf_coef=0.4`, `max_grad_norm=0.5`, `cnn_channels=32`, `d_model=64`, `n_heads=8`, `dropout=0.1`, `use_attention=True`, `net_arch_pi=[64]`, `net_arch_vf=[64]`.
+- **DQN**: `buffer_size=100_000`, `learning_starts=1_000` (0 saat _resume_), `batch_size=64`, `gamma=0.99`, `tau=1.0`, `train_freq=4`, `gradient_steps=1`, `target_update_interval=1_000`, `exploration_fraction=0.1`, `exploration_initial_eps=1.0`, `exploration_final_eps=0.05`, `hidden_dim=64`, `features_dim=64`, `cnn_channels=32`, `d_model=64`, `n_heads=8`, `use_attention=True`.
+
+> **Cara edit**: buka JSON di `game/model/configs/`, ubah nilai, simpan. Tidak perlu restart apa-apa — JSON dibaca ulang tiap kali `_from_json_dict()` dipanggil (yaitu di awal setiap run).
 
 ### Langkah 1 — Vectorised Environment (`make_vec_env`)
 
@@ -115,29 +181,47 @@ env = make_vec_env(level=level, obs_type=obs_type, n_envs=n_envs, seed=seed)
 
 ### Langkah 2 — Logger Directory (`resolve_logger_dir`)
 
-Membuat direktori TensorBoard dengan skema penamaan yang sama dengan model:
+Membuat direktori TensorBoard dengan skema penamaan yang sama dengan model (termasuk token `<obstype>`):
 
 ```
-logs/tb_logs/<prefix>_<algo>_level<L>[_<n>]/
+logs/tb_logs/<prefix>_<algo>[_<obstype>]_level<L>[_<n>]/
 └── checkpoints/
 ```
 
-Auto-increment suffix `_1`, `_2`, ... bila nama sudah dipakai.
+Auto-increment suffix `_1`, `_2`, ... bila nama sudah dipakai. Contoh konkret:
+
+```
+logs/tb_logs/snake_ppo_sptmp_level1/
+logs/tb_logs/snake_ppo_12bit_level1/
+logs/tb_logs/snake_dqn_sptmp_level1/
+logs/tb_logs/snake_dqn_12bit_level1/
+```
+
+Empat direktori di atas adalah run terpisah di TensorBoard — bisa dibandingkan side-by-side untuk _cross-comparison_ architecture × algorithm.
 
 ### Langkah 3 — Model Construction (`build_ppo` / `build_dqn`)
 
-- **New run**: instantiate `PPO(...)` atau `DQN(...)` dengan policy kwargs kustom (`SpatiotemporalExtractor` atau `DQN12BitExtractor`).
+- **New run**: instantiate `PPO(...)` atau `DQN(...)` dengan policy kwargs kustom:
+  - `obs_type == "12bit"` → `make_ppo_policy_kwargs(...)` / `make_dqn_policy_kwargs(...)` dengan MLP features extractor (3-layer Dense).
+  - `obs_type ∈ {"spatiotemporal", "spatiotemporal_legacy"}` → factory CNN+Attention yang membaca channel count dari `observation_space.shape[0]` (auto-handles 4- dan 8-channel).
 - **Resume**: panggil `PPO.load()` / `DQN.load()` dengan `custom_objects={"learning_rate": ...}` agar schedule LR dapat di-override per-stage curriculum. Setelah `load()`, kedua trainer men-override `model.lr_schedule` (PPO juga `model.clip_range`) lewat helper bersama `build_lr_schedule(...)` di `game/train/utility.py`. Lihat §LR Schedule di bawah untuk motivasi linear decay.
 
 ### LR & Clip-Range Schedule (Linear Decay)
 
-Kedua algoritma (PPO dan DQN) memakai **linear decay** terhadap `learning_rate` — dan PPO juga terhadap `clip_range` — mengikuti recipe asli PPO (Schulman et al. 2017). Helper bersama [`build_lr_schedule(learning_rate, use_linear, end_fraction)`](game/train/utility.py) membungkus SB3 `get_linear_fn(...)` / `get_schedule_fn(...)` dan dipakai oleh `build_ppo()` maupun `build_dqn()`.
+Kedua algoritma (PPO dan DQN) memakai **linear decay** terhadap `learning_rate` — dan PPO juga terhadap `clip_range` — mengikuti recipe asli PPO (Schulman et al. 2017). Helper bersama [`build_lr_schedule(learning_rate, use_linear, end_fraction)`](../../game/train/utility.py) membungkus SB3 `get_linear_fn(...)` / `get_schedule_fn(...)` dan dipakai oleh `build_ppo()` maupun `build_dqn()`.
 
-| Field                 | Default | Arti                                                                        |
-| --------------------- | ------- | --------------------------------------------------------------------------- |
-| `use_linear_schedule` | `True`  | `True` → linear decay; `False` → konstan                                    |
-| `lr_end_fraction`     | `0.0`   | LR akhir = `learning_rate × lr_end_fraction` (`0.0` = 0)                    |
-| `clip_end_fraction`   | `0.0`   | clip_range akhir = `clip_range × clip_end_fraction` (`0.0` = 0). Hanya PPO. |
+| Field                 | Default | Arti                                                            |
+| --------------------- | ------- | --------------------------------------------------------------- |
+| `use_linear_schedule` | `True`  | `True` → linear decay; `False` → konstan                        |
+| `lr_end_fraction`     | varies  | LR akhir = `learning_rate × lr_end_fraction` (`0.0` = 0)        |
+| `clip_end_fraction`   | varies  | clip_range akhir = `clip_range × clip_end_fraction`. Hanya PPO. |
+
+Default nilai di JSON:
+
+| Algoritma | `lr_end_fraction` | `clip_end_fraction` |
+| --------- | ----------------- | ------------------- |
+| PPO       | `0.1`             | `0.05`              |
+| DQN       | `0.0`             | —                   |
 
 **Mengapa linear decay (bukan konstan)?** Schedule konstan pada policy yang sudah matang membuat optimizer terus membuat update besar dan "mengetuk" policy keluar dari region bagus — gejala yang muncul sebagai osilasi reward di akhir pelatihan (sekitar 500k–700k step pada run PPO Level 1). Decay linear mengecilkan step size seiring policy konvergen sehingga osilasi mereda. Untuk kembali ke schedule konstan, set `use_linear_schedule=False` di config (atau turunkan `learning_rate` manual saat resume).
 
@@ -171,7 +255,7 @@ model.learn(
     total_timesteps=config.total_timesteps,
     callback=checkpoint_cb,
     tb_log_name="ppo_run" | "dqn_run",
-    reset_num_timesteps=(config.load_path is None),
+    reset_num_timesteps=(config.load_path is None) or config.use_linear_schedule,
     progress_bar=progress_bar,
 )
 ```
@@ -183,16 +267,18 @@ model.learn(
 ### Langkah 6 — Final Save (`auto_naming` → `model.save`)
 
 ```python
-final_path = auto_naming(prefix=output_prefix, algo=algo, level=level)
+final_path = auto_naming(prefix=output_prefix, algo=algo, level=level, obs_type=obs_type)
 model.save(str(final_path))
 ```
 
 `auto_naming` menghasilkan path unik dengan suffix auto-increment untuk mencegah overwrite:
 
 ```
-saved_models/snake_ppo_level1.zip
-saved_models/snake_ppo_level1_1.zip  # jika sudah ada
+saved_models/snake_ppo_sptmp_level1.zip
+saved_models/snake_ppo_sptmp_level1_1.zip  # jika sudah ada
 ```
+
+Lihat §Skema Penamaan File untuk token `<obstype>`.
 
 ### Progress Bar (`RewardProgressBarCallback`)
 
@@ -213,29 +299,47 @@ Postfix keys:
 Contoh bar:
 
 ```
-PPO level1:  45%|████▌     | 90k/200k [02:13<02:39, 678 step/s] {rew=-0.82, len=6.4, eps=42, ▃▅▆▄▅▇▆▅▄▃}
+PPO spatiotemporal level1:  45%|████▌     | 90k/200k [02:13<02:39, 678 step/s] {rew=-0.82, len=6.4, eps=42, ▃▅▆▄▅▇▆▅▄▃}
 ```
 
+Deskripsi bar sekarang menyertakan `obs_type` agar user tahu pipeline mana yang sedang berjalan.
+
 **Mengapa `len` lebih informatif daripada reward?** Reward pada Snake noise-led (tiap episode bisa melonjak +10 atau anjlok -10 pada satu event). Panjang tubuh saat episode berakhir (= `INITIAL_SNAKE_LENGTH + jumlah_makanan_yang_dimakan`) memantulkan skill secara lebih halus dan cocok untuk memantau tren kenaikan lambat — lihat juga `prd/models/tensorboard.md § Sinyal TensorBoard` untuk metrik SB3 yang lebih diagnostik (`rollout/ep_len_mean`, `train/approx_kl`, `train/entropy_loss`).
+
+### Spawn-Proximity Curriculum (Warm-up)
+
+`game_environment` mendukung kurikulum penempatan target agar pelatihan tidak dimulai dari konfigurasi tersulit. Saat `SPAWN_PROXIMITY_ENABLED = true` di `game/env/config.json`, _initial food_ ditempatkan di dalam bola Manhattan radius `SPAWN_PROXIMITY_RADIUS` sel di sekitar kepala ular, dan hanya selama `SPAWN_PROXIMITY_STEPS` _env steps_ pertama. Tujuannya: agar agen mengenali asosiasi "makan → reward positif" sebelum harus menjelajah grid 20×20 secara membabi buta.
+
+Detail lengkap (filter jarak, fallback, perilaku _respawn_ setelah makan) didokumentasikan di [`prd/game/food.md § Spawn-Proximity Curriculum`](../game/food.md). Catatan yang relevan untuk pipeline pelatihan:
+
+- **Counter adalah per-proses.** Di `SubprocVecEnv`, setiap _worker_ mempertahankan kontributor sendiri, sehingga jendela _warm-up_ dihitung per env-step, bukan total langkah absolut. Untuk rollout paralel, kalikan `SPAWN_PROXIMITY_STEPS` dengan `n_envs` agar _warm-up_ sesuai dengan total langkah yang direncanakan.
+- **Hanya penempatan awal episode.** Episode yang dimulai setelah jendela terlampaui (atau setelah fitur dimatikan) kembali memakai sampler acak global.
+- **Override melalui config saja.** Tidak ada argumen runtime — aktif/nonaktifkan dilakukan sebelum `train_ppo()` / `train_dqn()` dipanggil dengan mengubah `config.json` (atau via _custom_ JSON loader bila Anda menambahkan wrapper).
+
+Disarankan sebagai _default_ untuk run PPO/DQN Level 1 di mana agen mulai dari bobot acak: aktifkan _warm-up_ untuk ~50k env-steps pertama, lalu biarkan proximity _off_ selama sisa pelatihan. Untuk level lanjut (≥ 3) di mana agen me-_resume_ dari bobot level-1, biarkan _off_ karena kemampuan navigasi sudah ada.
 
 ### Perbedaan Utama PPO vs DQN
 
 | Aspek                     | PPO                                            | DQN                                            |
 | ------------------------- | ---------------------------------------------- | ---------------------------------------------- |
 | VecEnv                    | `SubprocVecEnv` (jika `n_envs>1`)              | `DummyVecEnv` (default) atau capped multi-env  |
-| Obs type                  | `spatiotemporal` (4×20×20 tensor)              | `12bit` (flat 12-dim vector)                   |
+| Obs type (default)        | `spatiotemporal` (8×20×20 tensor)              | `12bit` (flat 12-dim vector)                   |
+| Obs type (alternatif)     | `12bit` atau `spatiotemporal_legacy`           | `spatiotemporal` atau `spatiotemporal_legacy`  |
 | Checkpoint `save_freq`    | dibagi `n_envs`                                | absolute                                       |
 | Replay buffer             | ❌ tidak di-save                               | ✅ di-save untuk resume                        |
 | Resume LR                 | di-override lewat `build_lr_schedule` (linear) | di-override lewat `build_lr_schedule` (linear) |
 | Default `total_timesteps` | `500_000`                                      | `200_000`                                      |
 | TUI parallelization       | 1..cpu_count                                   | 1..4 (hard cap)                                |
+| Default `learning_rate`   | `1e-3`                                         | `5e-4`                                         |
 
 ### Algoritma Pemilihan Model (Resume Guard)
 
-Sebelum `train_ppo` / `train_dqn` dipanggil, TUI launcher memvalidasi:
+Sebelum `train_ppo` / `train_dqn` dipanggil, TUI launcher memvalidasi tiga hal:
 
-1. **Filename match** — pola `_(ppo|dqn)_level<digit>` harus cocok dengan algoritma aktif (lihat `_algo_from_filename`).
-2. **File existence** — `Path(...).is_file()` dicek ulang sebelum loading (mencegah stale pick setelah file dihapus/dipindahkan).
-3. **Learning starts** — untuk DQN `learning_starts=0` saat _resume_ (supaya tidak membuang langkah awal untuk random exploration ulang).
+1. **Filename — algorithm match** — pola `_(algo)[_(obstype)]?_level<digit>` harus cocok dengan `Algorithm` aktif (lihat `_algo_from_filename`). Model lama tanpa token obs_type lolos validasi ini; model baru harus punya token yang cocok.
+2. **Filename — obs_type match** — kalau nama file punya token `<obstype>`, token itu harus sama dengan `Obs Type` aktif (lihat `_obs_type_from_filename` dan `_drop_mismatched_model`). File tanpa token lolos (fallback ke metadata SB3 saat load).
+3. **File existence** — `Path(...).is_file()` dicek ulang sebelum loading (mencegah stale pick setelah file dihapus/dipindahkan).
 
-Ketiganya menghasilkan pesan error ramah dan kembali ke menu utama, alih-alih crash di dalam SB3 loader.
+Untuk DQN, tambahan kecil: `learning_starts=0` saat _resume_ supaya tidak membuang langkah awal untuk random exploration ulang.
+
+Ketiganya menghasilkan pesan error ramah dan kembali ke menu utama, alih-alih crash di dalam SB3 loader. Picker di TUI sudah pre-filter dengan logika yang sama, jadi kombinasi yang sampai ke validasi akhir biasanya hanya muncul karena rename manual atau corruption.

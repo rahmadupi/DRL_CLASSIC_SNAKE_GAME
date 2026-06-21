@@ -2,28 +2,38 @@
 PPO Trainer
 ===========
 
-Builds a :class:`stable_baselines3.PPO` agent wired with the
-:class:`SpatiotemporalExtractor`, the vectorised env, the
-:class:`CheckpointCallback`, and the TensorBoard logger — all from a
-single ``train_ppo(...)`` call.
+Builds a :class:`stable_baselines3.PPO` agent supporting BOTH the
+spatiotemporal (8×20×20) CNN+Transformer encoder AND the 12-bit
+flat-vector baseline.
+
+Hyperparameter defaults live in
+``game/model/configs/ppo_config.json`` and are loaded by
+:meth:`PPOTrainingConfig.from_json_dict`. The TUI launcher passes
+per-run overrides (level, obs_type, total_timesteps, …).
 
 Usage::
 
     from game.train.ppo_trainer import train_ppo, PPOTrainingConfig
 
-    config = PPOTrainingConfig(
+    # Spatiotemporal run (default)
+    config = PPOTrainingConfig.from_json_dict(
         level=1,
-        n_envs=4,
-        total_timesteps=500_000,
-        learning_rate=1e-4,        # 1e-4 (conservative) vs 5e-4 (aggressive)
-        checkpoint_freq=50_000,
+        obs_type="spatiotemporal",
     )
+
+    # 12-bit MLP run
+    config = PPOTrainingConfig.from_json_dict(
+        level=2,
+        obs_type="12bit",
+        learning_rate=5e-4,
+    )
+
     model, saved_path = train_ppo(config)
 
     # Continue learning (curriculum)
-    config2 = PPOTrainingConfig(
-        level=2,
-        n_envs=4,
+    config2 = PPOTrainingConfig.from_json_dict(
+        level=3,
+        obs_type="spatiotemporal",
         total_timesteps=500_000,
         load_path=saved_path,
     )
@@ -35,19 +45,22 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.vec_env import VecEnv
 
 from game.env.game_environment import game_environment  # noqa: F401  (re-exported)
+from game.model.configs import load_config as load_ppo_config
+from game.model.ppo_12bit import make_ppo_policy_kwargs as make_ppo_12bit_kwargs
 from game.model.ppo_spatiotemporal import (
     SpatiotemporalExtractor,
-    make_ppo_policy_kwargs,
+    make_ppo_policy_kwargs as make_ppo_sptmp_kwargs,
 )
 from game.train.utility import (
     RewardProgressBarCallback,
+    RolloutMetricsCallback,
     TrainingRenderCallback,
     auto_naming,
     build_lr_schedule,
@@ -66,12 +79,18 @@ class PPOTrainingConfig:
 
     # Curriculum
     level: int = 1
-    obs_type: str = "spatiotemporal"   # PPO uses the 8-channel v2 tensor
-                                        # (set to "spatiotemporal_legacy" to
-                                        #  load a model trained on the old
-                                        #  4-channel v1 layout)
+    obs_type: str = "spatiotemporal"
+    # Accepted values:
+    #   "spatiotemporal"        — 8×20×20 tensor       (CNN+Attention)
+    #   "spatiotemporal_legacy" — 4×20×20 tensor       (CNN+Attention)
+    #   "12bit"                 — flat 12-dim vector    (MLP)
 
     # Parallelism
+    # 4 envs is the sweet spot for Snake-on-PPO: enough decorrelation to
+    # cut per-iter variance, small enough to keep iteration wall-time low.
+    # TrainingRenderCallback auto-disables at n_envs > 1 (the demo window
+    # only makes sense with a single in-process env), which also restores
+    # fps after switching from n_envs=1.
     n_envs: int = 1
 
     # Schedule
@@ -79,15 +98,19 @@ class PPOTrainingConfig:
     # Optional user-facing episode target. When set, the progress bar
     # shows ``eps/total_episodes`` instead of just the running count.
     total_episodes: Optional[int] = None
-    learning_rate: float = 7e-4       # conservative default; 1e-3 1e-4
-    n_steps: int = 4096 #2048
-    batch_size: int = 128 #64
-    n_epochs: int = 5 # 7
+    learning_rate: float = 1e-3       # conservative default; 1e-3 1e-4 7e-4
+    # With n_envs=4, n_steps=2048 → 8192 transitions/rollout, split into
+    # 32 minibatches of 256 → 160 gradient steps per iter. Same update
+    # budget as the old (n_envs=1, n_steps=4096, batch_size=128), but
+    # with 4× more decorrelated experience feeding GAE.
+    n_steps: int = 2048
+    batch_size: int = 256
+    n_epochs: int = 9
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.03
-    vf_coef: float = 0.5
+    ent_coef: float = 0.018
+    vf_coef: float = 0.4
     max_grad_norm: float = 0.5
 
     # Learning-rate / clip-range schedule.
@@ -106,18 +129,33 @@ class PPOTrainingConfig:
     #   X-axis for the new run restarts at 0, but the old run's logs
     #   remain available in their original directory.
     use_linear_schedule: bool = True
-    lr_end_fraction: float = 0.1        # 0.0 → decay LR all the way to 0
-    clip_end_fraction: float = 0.0      # 0.0 → decay clip all the way to 0
+    lr_end_fraction: float = 0.1
+    clip_end_fraction: float = 0.05
 
-    # Architecture (forwarded to SpatiotemporalExtractor)
-    # Defaults bumped to (64, 128, 4) — head_dim = 128/4 = 32, healthy.
-    # Total params: ~280k (≈4× the previous 32/64/4 ≈ 75k).
-    # Dropout=0.1 added as regularization for the larger capacity.
-    cnn_channels: int = 64 # 32
-    d_model: int = 128 # 64
+    # Architecture — 12-bit MLP path
+    hidden_dim: int = 64
+
+    # Architecture — spatiotemporal (CNN+attention) path
+    # Defaults at (32, 64, 8) — head_dim = 64/8 = 8, healthy.
+    # Total params: ~75k (well-matched to level-1 Snake's 20×20 grid).
+    # The earlier (64, 128) was 4× larger; at iter 1–4 we saw
+    # ``entropy_loss ≈ -ln(4)`` for four iters straight, suggesting the
+    # policy was still uniform — extra capacity wasn't helping and just
+    # slows each iteration. Bump back to (64, 128) only if level ≥ 3 or
+    # if dynamic-food evasion starts to underfit.
+    cnn_channels: int = 32
+    d_model: int = 64
     n_heads: int = 8
-    dropout: float = 0.2
+    dropout: float = 0.1
     use_attention: bool = True         # toggle for the ablation experiment
+
+    # Actor/critic post-extractor MLP widths. Defaults match the
+    # spatiotemporal recipe (single 64-unit hidden layer before the
+    # 4-logit / 1-scalar head). Only consulted when ``obs_type="12bit"``
+    # AND the JSON provides them; spatiotemporal passes them through to
+    # :func:`make_ppo_sptmp_kwargs` for the actor-critic policy.
+    net_arch_pi: Optional[list] = field(default_factory=lambda: [64])
+    net_arch_vf: Optional[list] = field(default_factory=lambda: [64])
 
     # Output
     output_prefix: str = "snake"
@@ -127,6 +165,38 @@ class PPOTrainingConfig:
 
     # Resume from an existing checkpoint (for curriculum continuous-learning)
     load_path: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # JSON loader
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_json_dict(
+        cls,
+        json_or_algo: Any = None,
+        **overrides: Any,
+    ) -> "PPOTrainingConfig":
+        """
+        Build a config from the JSON file + per-run overrides.
+
+        Call styles (mirrors :meth:`DQNTrainingConfig.from_json_dict`):
+
+        1. ``PPOTrainingConfig.from_json_dict()``
+        2. ``PPOTrainingConfig.from_json_dict("ppo", level=3, obs_type="12bit")``
+        3. ``PPOTrainingConfig.from_json_dict({...})``
+        """
+        if isinstance(json_or_algo, dict):
+            base: Dict[str, Any] = dict(json_or_algo)
+        elif json_or_algo is None or json_or_algo == "ppo":
+            base = load_ppo_config("ppo")
+        elif isinstance(json_or_algo, (str, os.PathLike)):
+            base = load_ppo_config("ppo", path=json_or_algo)
+        else:
+            raise TypeError(
+                f"Unsupported first argument: {type(json_or_algo).__name__}. "
+                f"Expected dict, 'ppo', or a path."
+            )
+        base.update(overrides)
+        return cls(**base)
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +213,29 @@ def build_ppo(
     Exposed separately so unit tests can introspect the model without
     paying the cost of ``learn()``.
     """
-    policy_kwargs = make_ppo_policy_kwargs(
-        cnn_channels=config.cnn_channels,
-        d_model=config.d_model,
-        n_heads=config.n_heads,
-        dropout=config.dropout,
-        use_attention=config.use_attention,
-    )
+    # Pick the right policy-kwargs factory based on the chosen obs_type.
+    # Spatiotemporal variants share the CNN+attention encoder
+    # (4- and 8-channel layouts both work — the extractor reads the
+    # channel count from the obs space shape). 12-bit uses an MLP.
+    if config.obs_type == "12bit":
+        policy_kwargs = make_ppo_12bit_kwargs(
+            hidden_dim=config.hidden_dim,
+            net_arch_pi=config.net_arch_pi,
+            net_arch_vf=config.net_arch_vf,
+        )
+    else:
+        # "spatiotemporal" or "spatiotemporal_legacy"
+        policy_kwargs = make_ppo_sptmp_kwargs(
+            cnn_channels=config.cnn_channels,
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            dropout=config.dropout,
+            use_attention=config.use_attention,
+            net_arch=dict(
+                pi=list(config.net_arch_pi or [64]),
+                vf=list(config.net_arch_vf or [64]),
+            ),
+        )
 
     # Build learning-rate and clip-range schedules (constant or linear).
     # Both branches are SB3-compatible callables that map
@@ -239,7 +325,8 @@ def train_ppo(
     3. Wire up a :class:`CheckpointCallback` that saves every
        ``checkpoint_freq`` timesteps into ``saved_models/``.
     4. ``model.learn(...)`` for ``config.total_timesteps`` steps.
-    5. Save the final model to a uniquely-named ``.zip`` via :func:`auto_naming`.
+    5. Save the final model to a uniquely-named ``.zip`` whose name
+       embeds the obs_type token (``12bit``, ``sptmp``, ``sptmp_lgcy``).
     6. Close the env and return ``(model, final_path)``.
     """
     # --- 1. Env -----------------------------------------------------------
@@ -251,10 +338,13 @@ def train_ppo(
     )
 
     # --- 2. Logger directory ---------------------------------------------
+    # The logger dir embeds the obs_type token too, so TensorBoard runs
+    # for 12-bit and spatiotemporal variants never collide.
     tb_dir = resolve_logger_dir(
         prefix=config.output_prefix,
         algo="ppo",
         level=config.level,
+        obs_type=config.obs_type,
     )
 
     # --- 3. Model ---------------------------------------------------------
@@ -276,11 +366,20 @@ def train_ppo(
     # reward read from `model.ep_info_buffer`. Disable SB3's built-in bar
     # so we don't render two progress lines at once.
     callbacks = [checkpoint_cb]
+
+    # Snake-specific rollout metrics — always on, no toggle. Cheap (a
+    # handful of dict accesses and arithmetic per rollout), and the
+    # ``snake_length`` curve is the single most useful diagnostic for
+    # Snake training (much smoother than ``ep_rew_mean``, which is
+    # dominated by ±10 eat/collision spikes). See
+    # ``RolloutMetricsCallback`` for the full list of scalars logged.
+    callbacks.append(RolloutMetricsCallback())
+
     if progress_bar:
         callbacks.append(
             RewardProgressBarCallback(
                 total_timesteps=config.total_timesteps,
-                desc=f"PPO level{config.level}",
+                desc=f"PPO {config.obs_type} level{config.level}",
                 total_episodes=config.total_episodes,
             )
         )
@@ -294,7 +393,7 @@ def train_ppo(
         callbacks.append(
             TrainingRenderCallback(
                 fps=30,
-                window_title=f"PPO level{config.level} — Training",
+                window_title=f"PPO {config.obs_type} level{config.level} — Training",
             )
         )
 
@@ -321,6 +420,7 @@ def train_ppo(
         prefix=config.output_prefix,
         algo="ppo",
         level=config.level,
+        obs_type=config.obs_type,
     )
     model.save(str(final_path))
 

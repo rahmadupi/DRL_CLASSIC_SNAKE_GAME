@@ -43,6 +43,7 @@ from tqdm.auto import tqdm
 from game.env.config import config as _cfg
 
 from game.env.game_environment import game_environment
+from game.model.configs import obs_type_token
 
 
 # ---------------------------------------------------------------------------
@@ -206,22 +207,33 @@ def auto_naming(
     prefix: str,
     algo: str,
     level: int,
+    obs_type: Optional[str] = None,
     base_dir: Optional[os.PathLike] = SAVED_MODELS_DIR,
 ) -> Path:
     """
     Return a unique output path of the form::
 
-        <base_dir>/<prefix>_<algo>_level<L>[_<n>].zip
+        <base_dir>/<prefix>_<algo>[_<obstype>]_level<L>[_<n>].zip
+
+    ``<obstype>`` is the **short** filename token (``12bit``, ``sptmp``,
+    ``sptmp_lgcy``) so the stem stays compact and the TUI preview line
+    still fits inside the centered 50-char container. The full obs_type
+    name is reconstructed from the token by
+    :func:`game.model.configs.obs_type_from_token` when the file is
+    later loaded by :meth:`input_controller.load_model`.
 
     If that filename already exists, append ``_<n>`` (incrementing ``n``
     from 1) until a free name is found. This avoids silently overwriting
     earlier checkpoints.
 
     Args:
-        prefix:   User-provided label (will be sanitised).
-        algo:     ``"ppo"`` or ``"dqn"``.
-        level:    Curriculum level (1-5).
-        base_dir: Destination directory. Defaults to ``saved_models/``.
+        prefix:    User-provided label (will be sanitised).
+        algo:      ``"ppo"`` or ``"dqn"``.
+        level:     Curriculum level (1-5).
+        obs_type:  Long obs_type name (``"12bit"``, ``"spatiotemporal"``,
+                   ``"spatiotemporal_legacy"``). When ``None`` the
+                   algorithm token alone is used (legacy behaviour).
+        base_dir:  Destination directory. Defaults to ``saved_models/``.
 
     Returns:
         An unused ``Path`` whose suffix is ``.zip``.
@@ -231,13 +243,13 @@ def auto_naming(
 
     safe_prefix = _sanitise_prefix(prefix)
     algo = algo.lower()
-    stem = f"{safe_prefix}_{algo}_level{level}"
+    stem = _build_stem(safe_prefix, algo, level, obs_type)
 
     candidate = base_dir / f"{stem}.zip"
     if not candidate.exists():
         return candidate
 
-    # Auto-increment: foo_ppo_level3.zip → foo_ppo_level3_1.zip → _2 ...
+    # Auto-increment: foo_ppo_sptmp_level3.zip → ..._1.zip → _2 ...
     n = 1
     while True:
         candidate = base_dir / f"{stem}_{n}.zip"
@@ -250,18 +262,22 @@ def resolve_logger_dir(
     prefix: str,
     algo: str,
     level: int,
+    obs_type: Optional[str] = None,
     root: Optional[os.PathLike] = LOG_ROOT,
 ) -> Path:
     """
     Build the TensorBoard log directory for a run.
 
-    Mirrors the model-naming scheme so logs and weights are easy to pair::
+    Mirrors the model-naming scheme so logs and weights are easy to
+    pair::
 
-        logs/tb_logs/<prefix>_<algo>_level<L>[_<n>]/
+        logs/tb_logs/<prefix>_<algo>[_<obstype>]_level<L>[_<n>]/
+
+    ``<obstype>`` is the short token (see :func:`auto_naming`).
     """
     root = Path(root)
     safe_prefix = _sanitise_prefix(prefix)
-    stem = f"{safe_prefix}_{algo.lower()}_level{level}"
+    stem = _build_stem(safe_prefix, algo.lower(), level, obs_type)
 
     candidate = root / stem
     if not candidate.exists():
@@ -276,6 +292,23 @@ def resolve_logger_dir(
             candidate.mkdir(parents=True, exist_ok=False)
             return candidate
         n += 1
+
+
+def _build_stem(prefix: str, algo: str, level: int, obs_type: Optional[str]) -> str:
+    """
+    Build the shared ``<prefix>_<algo>[_<obstype>]_level<L>`` stem.
+
+    Pulled out of :func:`auto_naming` and :func:`resolve_logger_dir`
+    so the two stay in lock-step — adding a new obs_type field only
+    touches this one helper.
+
+    ``obs_type=None`` keeps the legacy stem (no obs token) so older
+    saved-models / log folders keep loading under the same path.
+    """
+    if obs_type:
+        token = obs_type_token(obs_type)
+        return f"{prefix}_{algo}_{token}_level{level}"
+    return f"{prefix}_{algo}_level{level}"
 
 
 # ---------------------------------------------------------------------------
@@ -303,14 +336,22 @@ def get_cpu_count() -> int:
 # ---------------------------------------------------------------------------
 # Convenience for tests / scripts
 # ---------------------------------------------------------------------------
-def preview_name(prefix: str, algo: str, level: int) -> Tuple[str, str]:
+def preview_name(
+    prefix: str,
+    algo: str,
+    level: int,
+    obs_type: Optional[str] = None,
+) -> Tuple[str, str]:
     """
     Return ``(display_name, full_path)`` for UI previews.
 
     The display name is the stem only (no directory, no ``.zip``), which
-    is what the TUI launcher shows in its preview row.
+    is what the TUI launcher shows in its preview row. ``obs_type`` is
+    the long obs name (``"spatiotemporal"``, ``"12bit"``); when
+    ``None`` the preview falls back to the legacy stem without the
+    obs token.
     """
-    path = auto_naming(prefix, algo, level)
+    path = auto_naming(prefix, algo, level, obs_type=obs_type)
     return path.stem, str(path)
 
 
@@ -568,6 +609,123 @@ class RewardProgressBarCallback(BaseCallback):
                 self.pbar.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Rollout metrics callback (TensorBoard)
+# ---------------------------------------------------------------------------
+class RolloutMetricsCallback(BaseCallback):
+    """
+    Log Snake-specific rollout metrics to TensorBoard.
+
+    SB3's built-in ``OnPolicyAlgorithm`` / ``OffPolicyAlgorithm`` only
+    record two per-episode scalars on their own:
+
+    * ``rollout/ep_rew_mean``  (mean cumulative episode reward)
+    * ``rollout/ep_len_mean``  (mean episode length **in env steps** —
+      i.e. how long the snake survived, not how big it grew)
+
+    For Snake, the more diagnostic "did the agent actually get better?"
+    curve is **snake body length** at the end of each episode (which
+    equals ``INITIAL_SNAKE_LENGTH + foods_eaten``). This callback
+    adds three scalars built from ``info["episode"]["snake_length"]``,
+    which the :class:`ConfigurableMonitor` wrapper merges into the
+    per-episode dict on the terminated/truncated step:
+
+    * ``rollout/snake_length_mean``  — running mean snake body length
+      over the last ``self._stats_window_size`` completed episodes
+      (default 100, matching ``BaseAlgorithm._stats_window_size``).
+      This is the curve to plot to see "is the snake actually growing".
+    * ``rollout/snake_length_max``   — max snake body length in the
+      same window. Useful for spotting best-case skill even when the
+      mean is dominated by short-lived deaths.
+    * ``rollout/eating_rate``        — fraction of episodes in the
+      window where the snake ate **at least one** food (``snake_length``
+      strictly greater than ``INITIAL_SNAKE_LENGTH``). A binary
+      success indicator — complements the continuous ``ep_rew_mean``
+      with a clearer "did anything happen?" view.
+
+    Why hook ``_on_rollout_end`` instead of ``_on_step``
+    -----------------------------------------------------
+    SB3 flushes its ``logger.record(...)`` calls via ``logger.dump()``
+    only at the end of a rollout (gated by ``log_interval`` in
+    ``learn()``). By calling ``self.logger.record(...)`` from
+    ``_on_rollout_end`` we piggy-back on that same flush, so our
+    scalar lands in the TensorBoard event file at the exact same
+    X-axis position as SB3's own ``rollout/ep_rew_mean``. Reading
+    directly from ``self.model.ep_info_buffer`` (instead of
+    maintaining our own deque) guarantees we use the **same**
+    100-episode rolling window SB3 uses for its metrics — no risk
+    of divergence between the two views of the same training.
+
+    No-op conditions
+    ----------------
+    * ``self.model.ep_info_buffer`` is ``None`` (older SB3 build).
+    * Buffer is empty (no episodes completed yet — typical for the
+      first few PPO rollouts where ``n_steps=2048`` and the snake
+      hasn't died yet).
+    * No episode in the buffer has the ``snake_length`` key (e.g.
+      running against an older env wrapper that didn't pass it
+      through ``info_keywords``). The callback silently skips the
+      record rather than emitting NaNs.
+    """
+
+    INITIAL_SNAKE_LENGTH = 3  # mirrors game/env/config.json — initial body length
+
+    def __init__(self, verbose: int = 0) -> None:
+        super().__init__(verbose=verbose)
+
+    # ``_on_step`` is a no-op here: SB3's ``_update_info_buffer``
+    # already populates ``self.model.ep_info_buffer`` on every step
+    # via ``BaseAlgorithm._update_info_buffer``. We only need to
+    # read from it at the end of the rollout.
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        # SB3 guarantees ``ep_info_buffer`` is initialised whenever
+        # ``Monitor`` wraps the env (which our ``make_vec_env`` does
+        # via ``ConfigurableMonitor``). Defensive check for robustness
+        # against future SB3 refactors.
+        buffer = getattr(self.model, "ep_info_buffer", None)
+        if buffer is None or len(buffer) == 0:
+            return
+
+        # Pull snake_length from the per-episode info dicts. Episodes
+        # that pre-date the ``snake_length`` info key are silently
+        # filtered out (their ``snake_length`` is ``None`` or missing
+        # — ``safe_mean`` would still cope but we want to be
+        # explicit).
+        lengths = [
+            float(ep["snake_length"])
+            for ep in buffer
+            if ep.get("snake_length") is not None
+        ]
+        if not lengths:
+            return
+
+        # Rolling mean / max over the same window SB3 uses. SB3 already
+        # constrains ``ep_info_buffer`` to ``maxlen=stats_window_size``
+        # (default 100) so the values are bounded.
+        n = len(lengths)
+        mean_len = sum(lengths) / n
+        max_len = max(lengths)
+        # Eating rate: episodes that ate at least one food. ``INITIAL``
+        # itself is 3 segments long at reset, so any length strictly
+        # greater than that proves a successful eat.
+        eating = sum(
+            1 for L in lengths if L > self.INITIAL_SNAKE_LENGTH
+        ) / n
+
+        # Use ``self.logger.record`` (NOT ``self.logger.dump``) — SB3
+        # owns the cadence. Both PPO's ``learn()`` and DQN's
+        # ``_dump_logs`` call ``logger.dump(step=self.num_timesteps)``
+        # shortly after ``on_rollout_end`` returns, which flushes
+        # these records to the TensorBoard event file together with
+        # ``rollout/ep_rew_mean`` and ``rollout/ep_len_mean``.
+        self.logger.record("rollout/snake_length_mean", mean_len)
+        self.logger.record("rollout/snake_length_max", max_len)
+        self.logger.record("rollout/eating_rate", eating)
 
 
 # ---------------------------------------------------------------------------
