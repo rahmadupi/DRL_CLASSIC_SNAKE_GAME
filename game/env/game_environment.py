@@ -53,6 +53,13 @@ REWARD_TIME = _cfg.REWARD_TIME
 REWARD_MOD = list(_cfg.REWARD_MOD)
 REWARD_MOD_CAP = list(_cfg.REWARD_MOD_CAP)
 
+# Stagnation penalty — charges the agent for steps that don't reduce
+# its distance to the nearest food. Targets the orbit attractor
+# (circling keeps distance ~constant) without changing terminal rewards.
+STAGNATION_ENABLED = _cfg.STAGNATION_ENABLED
+STAGNATION_THRESHOLD = _cfg.STAGNATION_THRESHOLD
+STAGNATION_PENALTY = _cfg.STAGNATION_PENALTY
+
 # Level configurations (JSON keys are strings → cast back to int)
 LEVEL_CONFIG = {int(k): v for k, v in _cfg.LEVEL_CONFIG.items()}
 
@@ -159,7 +166,7 @@ class game_environment(gym.Env):
         self,
         level: int = 1,
         obs_type: str = "spatiotemporal",
-        max_steps: int = 1000,
+        max_steps: int = _cfg.MAX_GAME_STEPS, # default 500, 
     ):
         super().__init__()
 
@@ -194,6 +201,13 @@ class game_environment(gym.Env):
         self.steps_taken: int = 0
         self.step_counter_for_dynamic: int = 0  # 2 out of 3 ticks for dynamic movement
 
+        # Stagnation tracking — number of consecutive steps without
+        # reducing the head's distance to the nearest food. Reset to 0
+        # in reset() and on any approach step (see step()).
+        self._no_progress_steps: int = 0
+        self._stagnation_threshold: int = STAGNATION_THRESHOLD
+        self._stagnation_penalty: float = STAGNATION_PENALTY
+
     # ---------- Public API ----------
 
     def reset(
@@ -210,15 +224,16 @@ class game_environment(gym.Env):
         self._init_food()
         self.steps_taken = 0
         self.step_counter_for_dynamic = 0
+        self._no_progress_steps = 0
         return self._get_obs(), {}
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         # Update penalty value
         global REWARD_COLLISION, REWARD_EAT_STATIC, REWARD_EAT_DYNAMIC
         if DYNAMIC_PENALTY:
-            REWARD_COLLISION = -10 * (1 + min(REWARD_MOD[0] * len(self.snake), REWARD_MOD_CAP[0])) # Increase penalty as snake grows, capped at -25
-            REWARD_EAT_STATIC = 10 * (1 + min(REWARD_MOD[1] * len(self.snake), REWARD_MOD_CAP[1])) #
-            REWARD_EAT_DYNAMIC = 8 * (1 + min(REWARD_MOD[2] * len(self.snake), REWARD_MOD_CAP[2])) #
+            REWARD_COLLISION = _cfg.REWARD_COLLISION * (1 + min(REWARD_MOD[0] * len(self.snake), REWARD_MOD_CAP[0])) # Increase penalty as snake grows, capped at -25
+            REWARD_EAT_STATIC = _cfg.REWARD_EAT_STATIC * (1 + min(REWARD_MOD[1] * len(self.snake), REWARD_MOD_CAP[1])) #
+            REWARD_EAT_DYNAMIC = _cfg.REWARD_EAT_DYNAMIC * (1 + min(REWARD_MOD[2] * len(self.snake), REWARD_MOD_CAP[2])) #
             
         self.steps_taken += 1
         self.step_counter_for_dynamic += 1
@@ -229,7 +244,13 @@ class game_environment(gym.Env):
         # Detect collision
         collision = self._check_collision(new_head)
         if collision:
-            return self._get_obs(), REWARD_COLLISION, True, False, {"reason": "collision"}
+            # Snake length at the moment of death — the head has NOT
+            # been appended yet, so ``self.snake`` still holds the
+            # pre-move length. This is what we want to log.
+            return self._get_obs(), REWARD_COLLISION, True, False, {
+                "reason": "collision",
+                "snake_length": len(self.snake),
+            }
 
         # Move snake
         ate_food = self._check_food_at(new_head)
@@ -245,13 +266,29 @@ class game_environment(gym.Env):
 
         # Check win condition
         if len(self.snake) >= MAX_GRID_AREA:
-            return self._get_obs(), REWARD_EAT_STATIC, True, False, {"reason": "win"}
+            return self._get_obs(), REWARD_EAT_STATIC, True, False, {
+                "reason": "win",
+                "snake_length": len(self.snake),
+            }
 
         # Check max steps
         truncated = self.steps_taken >= self.max_steps
         if truncated:
-            return self._get_obs(), REWARD_TIME, False, True, {"reason": "truncated"}
-        
+            return self._get_obs(), REWARD_TIME, False, True, {
+                "reason": "truncated",
+                "snake_length": len(self.snake),
+            }
+
+        # Stagnation tracking — use the same distance metric as the
+        # shaping reward so the two signals agree on what "progress"
+        # means. Reset the counter on any approach step; otherwise
+        # increment. Counter is consumed by _compute_reward below.
+        old_dist_stag = self._nearest_food_distance(old_head)
+        new_dist_stag = self._nearest_food_distance(new_head)
+        if new_dist_stag < old_dist_stag:
+            self._no_progress_steps = 0
+        else:
+            self._no_progress_steps += 1
 
         # Compute reward
         reward = self._compute_reward(old_head, new_head, food_type)
@@ -384,6 +421,18 @@ class game_environment(gym.Env):
 
         # 3. Time penalty
         reward += REWARD_TIME
+
+        # 4. Stagnation penalty — per-step cost after the head has gone
+        # ``STAGNATION_THRESHOLD`` consecutive steps without reducing
+        # its distance to the nearest food. Per-step (not one-shot)
+        # so the policy gradient is smooth across the threshold. Gated
+        # by STAGNATION_ENABLED so the env still runs cleanly when
+        # the feature is disabled via config.
+        if (
+            STAGNATION_ENABLED
+            and self._no_progress_steps >= self._stagnation_threshold
+        ):
+            reward += self._stagnation_penalty
 
         return reward
 

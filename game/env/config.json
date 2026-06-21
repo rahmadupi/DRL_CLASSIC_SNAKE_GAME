@@ -1,7 +1,7 @@
 {
   "_comment": "Central configuration for the Snake game env package. Edit values here, not in the .py files.",
 
-  "DEFAULT_FPS": 10,
+  "DEFAULT_FPS": 100,
   "DEFAULT_CELL_SIZE": 50,
   "DEFAULT_WALL_THICKNESS": 8,
 
@@ -20,15 +20,21 @@
     "LEFT": [0, -1]
   },
 
-  "DYNAMIC_PENALTY": false,
-  "REWARD_APPROACH": 1.0,
-  "REWARD_AWAY": -0.5,
-  "REWARD_EAT_STATIC": 10.0,
-  "REWARD_EAT_DYNAMIC": 9.0,
+  "DYNAMIC_PENALTY": true,
+  "REWARD_APPROACH": 0.04,
+  "REWARD_AWAY": -0.025,
+  "REWARD_EAT_STATIC": 12.0,
+  "REWARD_EAT_DYNAMIC": 10.0,
   "REWARD_COLLISION": -10.0,
-  "REWARD_TIME": -0.001,
-  "REWARD_MOD": [0.005, 0.004, 0.0025],
-  "REWARD_MOD_CAP": [1.5, 1.0, 1.0],
+  "REWARD_TIME": -0.002,
+  "REWARD_MOD": [0.005, 0.005, 0.0025],
+  "REWARD_MOD_CAP": [1.0, 1.0, 1.0],
+
+  "STAGNATION_ENABLED": true,
+  "STAGNATION_THRESHOLD": 25,
+  "STAGNATION_PENALTY": -0.02,
+
+  "MAX_GAME_STEPS": 500,
 
   "LEVEL_CONFIG": {
     "1": { "static": 1, "dynamic": 0 },

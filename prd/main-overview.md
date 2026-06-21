@@ -21,7 +21,7 @@ root/
 ├── prd/                        # Modul spesifikasi
 │
 ├── notebooks/                  # Eksperimen statis & pembuatan grafik
-│   └── plot_tensorboard.ipynb  # Analisis komparasi PPO vs DQN
+│   └── (analisis TensorBoard dilakukan via `tensorboard --logdir logs/tb_logs/` — lihat prd/models/train.md)
 │
 ├── game/                        # Core logic Game
 │   ├── __init__.py

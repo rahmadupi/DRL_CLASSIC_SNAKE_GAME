@@ -28,3 +28,15 @@ Lingkungan menerima parameter `level` untuk mengatur kompleksitas inisialisasi:
 ## Konfigurasi Peta
 
 - **Dimensi:** Grid 20x20 blok.
+
+## Info Dict pada Terminal Step
+
+`env.step()` mengembalikan `info` dict yang sekarang menyertakan `snake_length` setiap kali episode berakhir (`terminated` atau `truncated`). Nilai `snake_length` adalah panjang tubuh ular saat step tersebut - sama dengan `INITIAL_SNAKE_LENGTH + jumlah_makanan_yang_dimakan`.
+
+| Termination reason | Sumber `snake_length`                                                |
+| ------------------ | -------------------------------------------------------------------- |
+| `"collision"`      | `len(self.snake)` **sebelum** head baru di-append                    |
+| `"win"`            | `len(self.snake)` setelah append (= `MAX_GRID_AREA` = 400)           |
+| `"truncated"`      | `len(self.snake)` setelah append pada step yang melebihi `max_steps` |
+
+`Monitor` wrapper (di-install oleh `make_vec_env` di `game/train/utility.py`) me-merge field ini ke `ep_info_buffer`, sehingga tersedia untuk [`RewardProgressBarCallback`](game/train/utility.py) (postfix `len=`) dan analisis pasca-training. Episode lama yang tidak memiliki key `snake_length` di-skip dari rata-rata rolling window.

@@ -1,11 +1,154 @@
+import base64
+import io
+import json
 import os
+import pickle
 import random
-from typing import Tuple, Optional
+import re
+import zipfile
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
 import gymnasium as gym
 
 import pygame
 
 from game.env.config import config as _cfg
+
+
+# ============================================================================
+# Model introspection helpers
+# ============================================================================
+# Regex patterns for matching algorithm names in model filenames.
+# Anchored on word boundaries (`_-. /`) so e.g. "abracadabra" doesn't match.
+_ALGO_FILENAME_PATTERNS = {
+    "ppo": re.compile(r"(?:^|[_\-\s/.])ppo(?:[_\-\s/.]|$)", re.IGNORECASE),
+    "dqn": re.compile(r"(?:^|[_\-\s/.])dqn(?:[_\-\s/.]|$)", re.IGNORECASE),
+}
+
+# Stable-Baselines3 writes policy classes as pickled references wrapped in
+# ``{':type:': '<class-string>', ':serialized:': '<base64-pickle>'}``.
+# When unpickled, the class's ``__module__`` tells us which algorithm it
+# belongs to:
+#   - ``stable_baselines3.common.policies`` → ActorCriticPolicy → PPO
+#   - ``stable_baselines3.dqn.policies``    → DQNPolicy         → DQN
+# We keep the legacy plain-string mapping as a fallback for models saved
+# by older SB3 versions that wrote the class name as a JSON string.
+_POLICY_MODULE_TO_ALGO = {
+    "stable_baselines3.common.policies": "ppo",
+    "stable_baselines3.dqn.policies": "dqn",
+}
+_POLICY_CLASS_TO_ALGO = {
+    "ActorCriticPolicy": "ppo",
+    "DQNPolicy": "dqn",
+}
+
+
+def _decode_sb3_serialized(blob: str) -> Any:
+    """Decode SB3's ``{':serialized:': '<base64>'}`` payload.
+
+    Returns the unpickled Python object. Raises ``Exception`` on any
+    decode error — caller decides how to handle it.
+    """
+    return pickle.loads(base64.b64decode(blob))
+
+
+def _infer_obs_type_from_shape(shape) -> Optional[str]:
+    """Map an SB3 ``observation_space.shape`` to our env's ``obs_type``.
+
+    * ``(4, H, W)`` → ``"spatiotemporal"`` (any spatial size, not just 20×20)
+    * ``(12,)``    → ``"12bit"``
+    * else        → ``None`` (unknown)
+    """
+    tup = tuple(int(s) for s in shape)
+    if len(tup) == 3 and tup[0] == 4:
+        return "spatiotemporal"
+    if tup == (12,):
+        return "12bit"
+    return None
+
+
+def _read_sb3_metadata(zip_path: str) -> Dict[str, Any]:
+    """Read the SB3 ``data`` JSON from a saved model without loading PyTorch.
+
+    Returns dict with keys:
+        ``policy_class``  — SB3 class name (e.g. ``"ActorCriticPolicy"``)
+        ``obs_shape``     — tuple from ``observation_space["shape"]``
+        ``obs_type``      — mapped via :func:`_infer_obs_type_from_shape`
+        ``algo``          — ``"ppo"`` or ``"dqn"`` or ``None``
+    """
+    if not zipfile.is_zipfile(zip_path):
+        raise ValueError(f"{zip_path!r} is not a valid zip file.")
+    with zipfile.ZipFile(zip_path) as z:
+        names = z.namelist()
+        if "data" not in names:
+            raise ValueError(
+                f"{zip_path!r} has no 'data' entry — not a Stable-Baselines3 model."
+            )
+        with z.open("data") as f:
+            raw = f.read().decode("utf-8")
+
+    meta = json.loads(raw)
+
+    # ---------- Algorithm -------------------------------------------------
+    # SB3 ≥1.6 stores ``policy_class`` as
+    # ``{"type": "...", "serialized": "<base64-pickle>"}``. Older
+    # versions wrote a plain string. Handle both.
+    algo: Optional[str] = None
+    policy_module = ""
+    policy_field = meta.get("policy_class")
+    if isinstance(policy_field, str) and policy_field:
+        # Legacy: bare class name.
+        algo = _POLICY_CLASS_TO_ALGO.get(policy_field)
+        policy_module = policy_field
+    elif isinstance(policy_field, dict):
+        serialized = policy_field.get(":serialized:")
+        if isinstance(serialized, str) and serialized:
+            try:
+                cls_obj = _decode_sb3_serialized(serialized)
+                policy_module = getattr(cls_obj, "__module__", "") or ""
+                algo = _POLICY_MODULE_TO_ALGO.get(policy_module)
+                if algo is None:
+                    # Fallback: try the class name itself.
+                    algo = _POLICY_CLASS_TO_ALGO.get(
+                        getattr(cls_obj, "__name__", "")
+                    )
+            except Exception:
+                # Pickle may fail if the model was saved on a different
+                # machine or with a different SB3 version. Continue to
+                # filename-regex fallback below.
+                pass
+
+    # Final fallback: regex on the filename.
+    if algo is None:
+        fname = Path(zip_path).name.lower()
+        if _ALGO_FILENAME_PATTERNS["ppo"].search(fname):
+            algo = "ppo"
+        elif _ALGO_FILENAME_PATTERNS["dqn"].search(fname):
+            algo = "dqn"
+
+    # ---------- Observation space -----------------------------------------
+    # Same ``{:type:, :serialized:}`` envelope. Unpickle and read ``.shape``.
+    obs_shape: Optional[Tuple[int, ...]] = None
+    obs_field = meta.get("observation_space")
+    if isinstance(obs_field, dict):
+        serialized = obs_field.get(":serialized:")
+        if isinstance(serialized, str) and serialized:
+            try:
+                space_obj = _decode_sb3_serialized(serialized)
+                if hasattr(space_obj, "shape"):
+                    obs_shape = tuple(int(s) for s in space_obj.shape)
+            except Exception:
+                pass
+
+    return {
+        "algo": algo,
+        "policy_class": policy_module,
+        "obs_shape": obs_shape,
+        "obs_type": _infer_obs_type_from_shape(obs_shape) if obs_shape else None,
+    }
+
+
 # ============================================================================
 # Input Controller (HUMAN + AI PLACEHOLDER)
 # ============================================================================
@@ -45,6 +188,13 @@ class input_controller:
         # AI state (placeholder)
         self.ai_model = None  # TODO: Load trained model here
 
+        # Pause / return-to-menu flag. Set when the player presses
+        # ``R`` mid-game (currently in human mode); the launcher reads
+        # it each frame and pops the pause modal when it sees True.
+        # Cleared by ``reset_state()`` so it doesn't leak across
+        # retries or new games.
+        self.return_requested: bool = False
+
     # ----------------------------------------------------------------
     # Human Input
     # ----------------------------------------------------------------
@@ -67,8 +217,13 @@ class input_controller:
                     keep_running = False
                     action = None
                 elif event.key == pygame.K_r:
-                    # Reset request — return None to signal reset
-                    self.reset_state()
+                    # Pause / return-to-menu request. Just raise a
+                    # flag — the launcher (``_run_playing``) detects
+                    # it after ``process_human_input`` returns and
+                    # transitions to the RETURN_MODAL state. We do
+                    # NOT reset state here: the env must remain
+                    # frozen so "Continue" can resume the same game.
+                    self.return_requested = True
                     action = None
                 elif event.key in self.KEY_TO_ACTION:
                     action = self.KEY_TO_ACTION[event.key]
@@ -173,24 +328,97 @@ class input_controller:
             return random.choice(safe)
         return random.randint(0, 3)
 
-    def load_model(self, model_path: str) -> None:
+    def load_model(self, model_path: str) -> Dict[str, Any]:
         """
-        Load a trained PPO model from disk.
+        Load a trained PPO or DQN model from disk.
 
-        The env's `obs_type` must match the obs space the model was
-        trained on, otherwise the model's predictions will be garbage.
+        Inspects the SB3 ``.zip`` metadata (regex on filename + policy
+        class lookup) to determine the algorithm and the required env
+        ``obs_type``, then dispatches to the correct loader.
 
-        Usage:
-            controller.load_model("saved_models/ppo_level5.zip")
+        Returns a dict::
+
+            {
+                "algo":         "ppo" | "dqn",
+                "obs_type":     "spatiotemporal" | "12bit",
+                "obs_shape":    tuple,           # raw shape from metadata
+                "policy_class": str,             # SB3 class name
+                "model":        BaseAlgorithm,   # the loaded model
+            }
+
+        The caller MUST build an env whose ``obs_type`` equals the
+        returned ``obs_type`` — otherwise ``predict()`` will receive a
+        tensor of the wrong shape and silently produce garbage actions.
+
+        Raises:
+            RuntimeError: if the algorithm cannot be determined, the
+            observation space is unknown, or the model file is corrupt.
+
+        Usage::
+
+            info = controller.load_model("saved_models/dqn_baseline.zip")
+            env = game_environment(level=2, obs_type=info["obs_type"])
+            # env is now guaranteed to match the model's obs space.
         """
-        # Imported lazily so non-AI users don't need stable_baselines3
-        from stable_baselines3 import PPO
+        # 1) Inspect the zip metadata — cheap, no PyTorch involved.
+        try:
+            meta = _read_sb3_metadata(model_path)
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Could not read SB3 metadata from {model_path!r}: {exc!r}"
+            ) from exc
 
-        self.ai_model = PPO.load(model_path)
-        print(f"[input_controller] Loaded AI model: {model_path}")
+        algo = meta["algo"]
+        obs_type = meta["obs_type"]
+        policy_class = meta["policy_class"]
+
+        if algo is None:
+            raise RuntimeError(
+                f"Could not determine algorithm for {model_path!r}. "
+                f"Filename should contain 'ppo' or 'dqn' (got policy "
+                f"class {policy_class!r})."
+            )
+        if obs_type is None:
+            raise RuntimeError(
+                f"Unknown observation space shape {meta['obs_shape']!r} in "
+                f"{model_path!r}. Expected spatiotemporal (4,H,W) or 12bit (12,)."
+            )
+
+        # 2) Dispatch to the correct SB3 loader.
+        # Imported lazily so non-AI users don't need stable_baselines3.
+        from stable_baselines3 import DQN, PPO
+
+        if algo == "ppo":
+            loader, loader_name = PPO, "PPO"
+        else:  # algo == "dqn"
+            loader, loader_name = DQN, "DQN"
+
+        try:
+            self.ai_model = loader.load(model_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load {loader_name} model from {model_path!r}: {exc!r}"
+            ) from exc
+
+        print(
+            f"[input_controller] Loaded {loader_name} model "
+            f"(obs_shape={meta['obs_shape']!r}, obs_type={obs_type!r}): "
+            f"{model_path}"
+        )
+
+        return {
+            "algo": algo,
+            "obs_type": obs_type,
+            "obs_shape": meta["obs_shape"],
+            "policy_class": policy_class,
+            "model": self.ai_model,
+        }
 
     def reset_state(self):
         """Reset input state (call when env resets)."""
         self.current_action = None
         self.queued_action = None
         self.game_started = False
+        # Clear any stale pause/return request so the new game
+        # doesn't immediately re-pop the modal.
+        self.return_requested = False

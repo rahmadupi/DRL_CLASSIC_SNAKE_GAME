@@ -68,6 +68,7 @@ class State(Enum):
     FPS_MODAL = "fps_modal"
     PLAYING = "playing"
     DEATH_MODAL = "death_modal"
+    RETURN_MODAL = "return_modal"
     QUIT = "quit"
 
 
@@ -145,6 +146,11 @@ class Launcher:
         self.retry_button: Optional[Button] = None
         self.menu_button: Optional[Button] = None
 
+        # Pause / return-to-menu modal (triggered by R during PLAYING)
+        self.return_modal: Optional[Modal] = None
+        self.continue_button: Optional[Button] = None
+        self.return_menu_button: Optional[Button] = None
+
         # Game runtime handles
         self.env: Optional[game_environment] = None
         self.renderer: Optional[game_renderer] = None
@@ -169,6 +175,8 @@ class Launcher:
                 self._run_playing()
             elif self.state == State.DEATH_MODAL:
                 self._run_death_modal()
+            elif self.state == State.RETURN_MODAL:
+                self._run_return_modal()
         pygame.quit()
 
     # ------------------------------------------------------------------
@@ -558,24 +566,88 @@ class Launcher:
     # PLAYING
     # ------------------------------------------------------------------
     def _run_playing(self) -> None:
-        self._init_game()
-        assert self.env is not None and self.renderer is not None and self.controller is not None
+        # Detect a "resume from RETURN_MODAL" call. After the pause
+        # modal's Continue button is pressed, ``run()`` re-dispatches
+        # us here with state==PLAYING, but the env, controller, and
+        # renderer are still alive (frozen by the modal). Skipping the
+        # full init preserves the snake's position, score, AI belief
+        # state, and controller input buffer — so Continue actually
+        # continues, instead of wiping the game via env.reset().
+        resuming = (
+            self.env is not None
+            and self.controller is not None
+            and self.renderer is not None
+            and self.renderer_screen is not None
+        )
 
-        if self.mode == "ai":
-            try:
-                self.controller.load_model(self.model_path)
-            except Exception as exc:
-                print(f"[launcher] Could not load model: {exc!r}. Falling back to random AI.")
-                self.controller.ai_model = None
+        if not resuming:
+            # Fresh-start path: build controller, load model (AI mode),
+            # then build env + renderer.
+            self.controller = input_controller()
+            if self.mode == "ai":
+                self.controller.game_started = True
+
+            obs_type = "spatiotemporal"  # safe default for human mode
+            if self.mode == "ai" and self.model_path:
+                try:
+                    model_info = self.controller.load_model(self.model_path)
+                    obs_type = model_info["obs_type"]
+                    print(
+                        f"[launcher] Model requires obs_type={obs_type!r} "
+                        f"(algo={model_info['algo']}, shape={model_info['obs_shape']})"
+                    )
+                except Exception as exc:
+                    print(
+                        f"[launcher] Could not load model: {exc!r}. "
+                        f"Falling back to random AI."
+                    )
+                    self.controller.ai_model = None
+
+            self._init_game(obs_type=obs_type)
+            assert (
+                self.env is not None
+                and self.renderer is not None
+                and self.controller is not None
+            )
+        else:
+            # Resume path: env/controller/renderer already exist and
+            # are frozen. The modal's event loop consumed any input
+            # events that arrived while it was up, so the controller's
+            # current/queued action is still the last one the player
+            # applied before pressing R.
+            assert (
+                self.env is not None
+                and self.renderer is not None
+                and self.controller is not None
+            )
 
         running = True
         while running and self.state == State.PLAYING:
+            # 0. System-level keys (work in both human + AI mode).
+            # ``R`` pops the pause/return modal. Drained separately
+            # so it doesn't leak into the modal's event loop later.
+            for event in pygame.event.get(pygame.KEYDOWN):
+                if event.key == pygame.K_r:
+                    self.state = State.RETURN_MODAL
+                    running = False
+                    break
+            if not running or self.state != State.PLAYING:
+                continue
+
             # 1. Input
             if self.mode == "human":
                 action, keep_running = self.controller.process_human_input()
                 if not keep_running:
                     self.state = State.MENU
                     break
+                # Controller's ``return_requested`` flag is the human-
+                # mode hook for the same pause key the AI branch catches
+                # above (the controller owns its own event loop).
+                if self.controller.return_requested:
+                    self.controller.return_requested = False
+                    self.state = State.RETURN_MODAL
+                    running = False
+                    continue
                 if action is None:
                     if self.controller.game_started:
                         obs, _ = self.env.reset(seed=None)
@@ -597,7 +669,6 @@ class Launcher:
                     self.state = State.DEATH_MODAL
                     running = False
                     continue
-
             # 2. Draw — game renders to its own surface, then we blit
             # it centered into the launcher's single window
             self.renderer.draw_frame(
@@ -616,8 +687,16 @@ class Launcher:
         if self.state == State.MENU:
             self._teardown_game()
 
-    def _init_game(self) -> None:
-        self.env = game_environment(level=self.level, obs_type="spatiotemporal")
+    def _init_game(self, obs_type: str = "spatiotemporal") -> None:
+        # obs_type is decided by the caller:
+        #   - human mode → "spatiotemporal" (default; doesn't matter for rendering)
+        #   - AI mode    → from controller.load_model(...) return value,
+        #                  so the env's observation_space exactly matches
+        #                  what the loaded policy was trained on.
+        assert obs_type in ("spatiotemporal", "12bit"), (
+            f"Unsupported obs_type: {obs_type!r}"
+        )
+        self.env = game_environment(level=self.level, obs_type=obs_type)
         obs, _ = self.env.reset(seed=None)
         self._last_obs = obs
 
@@ -653,9 +732,9 @@ class Launcher:
             f"Level {self.level} — {'AI' if self.mode == 'ai' else 'Human'}"
         )
 
-        self.controller = input_controller()
-        if self.mode == "ai":
-            self.controller.game_started = True
+        # ``self.controller`` is created in ``_run_playing`` (before
+        # the model load) so it already exists at this point — don't
+        # overwrite it here.
 
     def _teardown_game(self) -> None:
         self.env = None
@@ -826,6 +905,171 @@ class Launcher:
 
     def _death_choice(self, choice: str) -> None:
         if choice == "retry":
+            self.state = State.PLAYING
+        else:
+            self.state = State.MENU
+
+    # ------------------------------------------------------------------
+    # RETURN_MODAL  (paused — R pressed during PLAYING)
+    # ------------------------------------------------------------------
+    def _run_return_modal(self) -> None:
+        """
+        Pause modal: offers "Continue" or "Main Menu".
+
+        Triggered by ``R`` during :data:`State.PLAYING` in either
+        human or AI mode. The env is *not* stepped while this modal
+        is up — only the last game frame is re-rendered behind it so
+        the player sees a frozen snapshot of the game.
+        """
+        assert self.renderer_screen is not None
+
+        screen_w, screen_h = self.screen.get_size()
+
+        # Auto-size the modal to fit title + 2 buttons.
+        try:
+            title_surf = render_text_pil("PAUSED", font_size=44, color=BLACK)
+            title_w, title_h = title_surf.get_size()
+        except Exception:
+            title_w, title_h = 200, 50
+
+        button_w = BUTTON_MIN_WIDTH + 20
+        button_h = 56
+        pad = 80
+        gap = 10
+        content_w = max(title_w, 2 * button_w + gap) + 2 * pad
+        content_h = title_h + button_h + 2 * gap + 1 * pad
+        max_w = int(screen_w * 0.6)
+        max_h = int(screen_h * 0.4)
+        modal_w = max(380, min(content_w, max_w))
+        modal_h = max(200, min(content_h, max_h))
+
+        modal = Modal(
+            (screen_w, screen_h),
+            title="PAUSED",
+            fixed_size=(modal_w, modal_h),
+        )
+
+        continue_btn = Button(
+            pygame.Rect(0, 0, button_w, button_h),
+            "Continue",
+            on_click=lambda: self._return_choice("continue"),
+        )
+        menu_btn = Button(
+            pygame.Rect(0, 0, button_w, button_h),
+            "Main Menu",
+            on_click=lambda: self._return_choice("menu"),
+        )
+        modal_buttons = [continue_btn, menu_btn]
+        selected_btn = 0  # 0 = Continue, 1 = Main Menu
+
+        # Same 1/4 + 3/4 row layout as the death modal — title at 1/4,
+        # buttons centred at 3/4.
+        button_y = modal.rect.top + 3 * modal.rect.height // 4
+        continue_btn.rect.midright = (modal.rect.centerx - 12, button_y)
+        menu_btn.rect.midleft = (modal.rect.centerx + 12, button_y)
+
+        self.return_modal = modal
+        self.continue_button = continue_btn
+        self.return_menu_button = menu_btn
+
+        running = True
+        while running and self.state == State.RETURN_MODAL:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.state = State.QUIT
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        # ESC = leave the game (same as "Main Menu").
+                        self._return_choice("menu")
+                        running = False
+                        continue
+                    if event.key == pygame.K_r:
+                        # R toggles: press again → resume.
+                        self._return_choice("continue")
+                        running = False
+                        continue
+                    if event.key in (pygame.K_LEFT,):
+                        selected_btn = (selected_btn - 1) % len(modal_buttons)
+                    elif event.key in (pygame.K_RIGHT,):
+                        selected_btn = (selected_btn + 1) % len(modal_buttons)
+                    elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                        modal_buttons[selected_btn].on_click()
+                        running = False
+                        continue
+                # Forward mouse events to buttons
+                if event.type in (
+                    pygame.MOUSEBUTTONDOWN,
+                    pygame.MOUSEBUTTONUP,
+                    pygame.MOUSEMOTION,
+                ):
+                    for child in modal_buttons:
+                        child.handle_event(event)
+                for btn in modal_buttons:
+                    if btn.clicked_this_frame():
+                        running = False
+
+            # Refresh "selected" flag each frame for the active button.
+            for i, btn in enumerate(modal_buttons):
+                btn.selected = (i == selected_btn)
+
+            # Re-draw the last game frame, blit it centered into the
+            # launcher window, then overlay the modal on top. The env
+            # is NOT stepped — the frame is a frozen snapshot of the
+            # snake's position when R was pressed.
+            if self.env is not None and self.renderer is not None:
+                self.renderer.draw_frame(
+                    self.renderer_screen,
+                    self.env,
+                    game_started=self.controller.game_started,
+                )
+            self.screen.fill(BG_CREAM)
+            self.screen.blit(
+                self.renderer_screen,
+                (self.game_offset_x, self.game_offset_y),
+            )
+            self._draw_return_modal_on_screen()
+            self.clock.tick(30)
+
+        if self.state == State.MENU:
+            self._teardown_game()
+        elif self.state == State.PLAYING:
+            # Resume — env was frozen during the modal, no reset needed.
+            # The controller's input state (current/queued action) is
+            # already correct because the modal's event loop consumed
+            # any arrow keys pressed while it was up.
+            pass
+
+    def _draw_return_modal_on_screen(self) -> None:
+        """Draw the PAUSED modal overlay on the launcher window."""
+        screen = self.screen
+        modal = self.return_modal
+        # Dim
+        dim = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 160))
+        screen.blit(dim, (0, 0))
+        # Panel
+        Panel(modal.rect, fill=PANEL_FILL).draw(screen)
+        # Title — center of top quarter (same row layout as buttons).
+        try:
+            t = render_text_pil("PAUSED", font_size=44, color=BLACK)
+            title_y = modal.rect.top + modal.rect.height // 4
+            screen.blit(t, t.get_rect(center=(modal.rect.centerx, title_y)))
+        except Exception:
+            pass
+        # Buttons
+        self.continue_button.draw(screen)
+        self.return_menu_button.draw(screen)
+        pygame.display.flip()
+
+    def _return_choice(self, choice: str) -> None:
+        """
+        Route the pause-modal choice.
+
+        ``"continue"`` → resume the frozen game (no env reset).
+        ``"menu"``     → tear down and return to the launcher menu.
+        """
+        if choice == "continue":
             self.state = State.PLAYING
         else:
             self.state = State.MENU
