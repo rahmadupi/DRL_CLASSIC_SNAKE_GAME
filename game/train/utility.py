@@ -141,7 +141,7 @@ def _make_env_fn(
         # ``info_keywords=()`` would silently drop everything.
         env = ConfigurableMonitor(
             env,
-            info_keywords=("snake_length",),
+            info_keywords=("snake_length", "approach_ratio"),
         )
         if seed is not None:
             env.reset(seed=seed)
@@ -644,6 +644,19 @@ class RolloutMetricsCallback(BaseCallback):
       strictly greater than ``INITIAL_SNAKE_LENGTH``). A binary
       success indicator — complements the continuous ``ep_rew_mean``
       with a clearer "did anything happen?" view.
+    * ``rollout/steps_per_food``     — average env steps required to
+      consume ONE food. Lower = more efficient hunting. Episodes
+      that ate zero food are excluded (they would otherwise dominate
+      the metric with their full episode length, which measures
+      survival rather than hunting skill).
+    * ``rollout/approach_ratio``     — fraction of shaping steps
+      where the snake moved **closer** to its committed target food.
+      A direct measure of goal-directed behaviour, independent of
+      the noisy ±10 reward spikes. Should rise above 0.5 as the
+      snake learns to "intentionally" head toward food.
+    * ``rollout/exploration_rate``   — current ε-greedy epsilon
+      (DQN only — ``model.exploration_rate``). For PPO, no scalar
+      is emitted here; use ``train/entropy_loss`` instead.
 
     Why hook ``_on_rollout_end`` instead of ``_on_step``
     -----------------------------------------------------
@@ -716,6 +729,52 @@ class RolloutMetricsCallback(BaseCallback):
         eating = sum(
             1 for L in lengths if L > self.INITIAL_SNAKE_LENGTH
         ) / n
+
+        # ---- Steps-per-food metric ----
+        # Average env steps required to consume ONE food. Episodes
+        # that ate zero food are excluded from the mean — they would
+        # otherwise dominate the metric with ``inf`` or with the full
+        # episode length (which measures survival, not hunting).
+        # ``t`` is the standard Monitor key for episode step count.
+        steps_per_food_vals = []
+        for L, ep in zip(lengths, buffer):
+            foods_eaten = L - self.INITIAL_SNAKE_LENGTH
+            if foods_eaten > 0 and ep.get("t") is not None:
+                steps_per_food_vals.append(ep["t"] / foods_eaten)
+        if steps_per_food_vals:
+            self.logger.record(
+                "rollout/steps_per_food",
+                sum(steps_per_food_vals) / len(steps_per_food_vals),
+            )
+
+        # ---- Approach-ratio metric ----
+        # Fraction of shaping steps where the snake moved closer to its
+        # target food. Read from the ``approach_ratio`` info key the
+        # env writes on every terminal step (collision / win /
+        # truncated). Episodes predating this key are skipped.
+        approach_ratios = [
+            float(ep["approach_ratio"])
+            for ep in buffer
+            if ep.get("approach_ratio") is not None
+        ]
+        if approach_ratios:
+            self.logger.record(
+                "rollout/approach_ratio",
+                sum(approach_ratios) / len(approach_ratios),
+            )
+
+        # ---- Exploration-rate metric (algorithm-specific) ----
+        # DQN exposes its current ε-greedy rate via
+        # ``model.exploration_rate`` (linear schedule from
+        # ``exploration_initial_eps`` down to ``exploration_final_eps``).
+        # PPO does not have a scalar exploration knob — its policy
+        # entropy is logged by SB3 as ``train/entropy_loss`` already,
+        # so we just skip the rollout/ slot for on-policy algorithms.
+        # ``getattr`` with default keeps the callback robust across
+        # algorithm switches in the future.
+        eps = getattr(self.model, "exploration_rate", None)
+        if eps is not None:
+            self.logger.record("rollout/exploration_rate", float(eps))
 
         # Use ``self.logger.record`` (NOT ``self.logger.dump``) — SB3
         # owns the cadence. Both PPO's ``learn()`` and DQN's

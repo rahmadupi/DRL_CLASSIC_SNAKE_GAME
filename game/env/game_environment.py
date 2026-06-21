@@ -378,6 +378,28 @@ class game_environment(gym.Env):
         # is eaten.
         self._target_food: Optional[Tuple[int, int]] = None
 
+        # Approach/away counters — used to compute the
+        # ``approach_ratio`` rollout metric (fraction of steps where
+        # the snake's head moved CLOSER to its target food vs farther).
+        # Reset to zero at every reset() and incremented inside
+        # _compute_reward based on the distance comparison. Both
+        # counters and the derived ratio are exposed via the terminal
+        # info dict so ``ConfigurableMonitor`` can surface them as
+        # ``info["episode"]["approach_ratio"]`` for the TensorBoard
+        # callback to read.
+        self._approach_count: int = 0
+        self._away_count: int = 0
+
+    @property
+    def _approach_ratio(self) -> float:
+        """Fraction of completed steps that moved the head closer to
+        its current target food. Returns 0.0 when no reward-shaping
+        steps have been recorded yet (e.g. immediate collision on
+        step 1).
+        """
+        total = self._approach_count + self._away_count
+        return self._approach_count / total if total > 0 else 0.0
+
     # ---------- Public API ----------
 
     def reset(
@@ -400,6 +422,10 @@ class game_environment(gym.Env):
         # The new episode starts uncommitted; the first step() will pick
         # the nearest static food.
         self._target_food = None
+        # Reset the approach/away counters so the per-episode ratio is
+        # computed only from this episode's shaping steps.
+        self._approach_count = 0
+        self._away_count = 0
         return self._get_obs(), {}
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
@@ -431,6 +457,7 @@ class game_environment(gym.Env):
             return self._get_obs(), REWARD_COLLISION, True, False, {
                 "reason": "collision",
                 "snake_length": len(self.snake),
+                "approach_ratio": self._approach_ratio,
             }
 
         # Move snake — append the new head, then decide whether to pop
@@ -462,6 +489,7 @@ class game_environment(gym.Env):
             return self._get_obs(), REWARD_EAT_STATIC, True, False, {
                 "reason": "win",
                 "snake_length": len(self.snake),
+                "approach_ratio": self._approach_ratio,
             }
 
         # Check max steps
@@ -470,6 +498,7 @@ class game_environment(gym.Env):
             return self._get_obs(), REWARD_TIME, False, True, {
                 "reason": "truncated",
                 "snake_length": len(self.snake),
+                "approach_ratio": self._approach_ratio,
             }
 
         # Stagnation tracking — use the same distance metric as the
@@ -827,8 +856,13 @@ class game_environment(gym.Env):
         new_dist = self._food_distance(new_head)
         if new_dist < old_dist:
             reward += REWARD_APPROACH
+            # Tally for the ``approach_ratio`` rollout metric. Counts
+            # EVERY step where distance strictly decreased — including
+            # the eat step itself (distance becomes 0).
+            self._approach_count += 1
         else:
             reward += REWARD_AWAY
+            self._away_count += 1
 
         # 2. Food eaten
         if food_type == "static":
