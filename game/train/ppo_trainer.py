@@ -66,7 +66,10 @@ class PPOTrainingConfig:
 
     # Curriculum
     level: int = 1
-    obs_type: str = "spatiotemporal"   # PPO always uses the 4-channel tensor
+    obs_type: str = "spatiotemporal"   # PPO uses the 8-channel v2 tensor
+                                        # (set to "spatiotemporal_legacy" to
+                                        #  load a model trained on the old
+                                        #  4-channel v1 layout)
 
     # Parallelism
     n_envs: int = 1
@@ -76,14 +79,14 @@ class PPOTrainingConfig:
     # Optional user-facing episode target. When set, the progress bar
     # shows ``eps/total_episodes`` instead of just the running count.
     total_episodes: Optional[int] = None
-    learning_rate: float = 1e-4       # conservative default; 1e-3 1e-4
+    learning_rate: float = 7e-4       # conservative default; 1e-3 1e-4
     n_steps: int = 4096 #2048
     batch_size: int = 128 #64
     n_epochs: int = 5 # 7
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.02
+    ent_coef: float = 0.03
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
@@ -103,7 +106,7 @@ class PPOTrainingConfig:
     #   X-axis for the new run restarts at 0, but the old run's logs
     #   remain available in their original directory.
     use_linear_schedule: bool = True
-    lr_end_fraction: float = 0.0        # 0.0 → decay LR all the way to 0
+    lr_end_fraction: float = 0.1        # 0.0 → decay LR all the way to 0
     clip_end_fraction: float = 0.0      # 0.0 → decay clip all the way to 0
 
     # Architecture (forwarded to SpatiotemporalExtractor)
@@ -112,8 +115,8 @@ class PPOTrainingConfig:
     # Dropout=0.1 added as regularization for the larger capacity.
     cnn_channels: int = 64 # 32
     d_model: int = 128 # 64
-    n_heads: int = 4
-    dropout: float = 0.1
+    n_heads: int = 8
+    dropout: float = 0.2
     use_attention: bool = True         # toggle for the ablation experiment
 
     # Output

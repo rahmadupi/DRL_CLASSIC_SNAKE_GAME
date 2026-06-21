@@ -143,6 +143,9 @@ class Launcher:
         # Death modal
         self.death_modal: Optional[Modal] = None
         self.death_score: int = 0
+        # "collision" (real death) or "truncated" (clock ran out).
+        # Set in _run_playing right before transitioning to DEATH_MODAL.
+        self.death_reason: str = "collision"
         self.retry_button: Optional[Button] = None
         self.menu_button: Optional[Button] = None
 
@@ -657,6 +660,7 @@ class Launcher:
                         obs, reward, term, trunc, info = self.env.step(action)
                         if term or trunc:
                             self.death_score = len(self.env.snake) - 3
+                            self.death_reason = info.get("reason", "collision")
                             self.state = State.DEATH_MODAL
                             running = False
                             continue
@@ -666,6 +670,7 @@ class Launcher:
                 self._last_obs = obs
                 if term or trunc:
                     self.death_score = len(self.env.snake) - 3
+                    self.death_reason = info.get("reason", "collision")
                     self.state = State.DEATH_MODAL
                     running = False
                     continue
@@ -693,10 +698,19 @@ class Launcher:
         #   - AI mode    → from controller.load_model(...) return value,
         #                  so the env's observation_space exactly matches
         #                  what the loaded policy was trained on.
-        assert obs_type in ("spatiotemporal", "12bit"), (
+        assert obs_type in ("spatiotemporal", "spatiotemporal_legacy", "12bit"), (
             f"Unsupported obs_type: {obs_type!r}"
         )
-        self.env = game_environment(level=self.level, obs_type=obs_type)
+        # Both gameplay modes (human AND AI) get an effectively-uncapped
+        # step budget. MAX_GAME_STEPS=500 is a TRAINING-time device only:
+        # the trainer calls game_environment() without overriding
+        # max_steps, so the env default of _cfg.MAX_GAME_STEPS applies.
+        # For gameplay the only "exit" conditions should be collision or
+        # the user pressing R — not the clock running out.
+        max_steps = 10_000
+        self.env = game_environment(
+            level=self.level, obs_type=obs_type, max_steps=max_steps,
+        )
         obs, _ = self.env.reset(seed=None)
         self._last_obs = obs
 
@@ -759,9 +773,12 @@ class Launcher:
         # up the new dimensions and centers the modal correctly.
         screen_w, screen_h = self.screen.get_size()
 
-        # Auto-size the modal to fit its content (title, score, 2 buttons)
+        # Auto-size the modal to fit its content (title, score, 2 buttons).
+        # Title reflects the actual cause: collision death vs clock timeout.
+        is_truncated = getattr(self, "death_reason", "collision") == "truncated"
+        title_str = "TIME UP" if is_truncated else "YOU DIED"
         try:
-            title_surf = render_text_pil("YOU DIED", font_size=44, color=BLACK)
+            title_surf = render_text_pil(title_str, font_size=44, color=BLACK)
             title_w, title_h = title_surf.get_size()
         except Exception:
             title_w, title_h = 200, 50
@@ -786,7 +803,7 @@ class Launcher:
 
         modal = Modal(
             (screen_w, screen_h),
-            title="YOU DIED",
+            title=title_str,
             fixed_size=(modal_w, modal_h),
         )
 
@@ -880,9 +897,12 @@ class Launcher:
         # Panel
         Panel(modal.rect, fill=PANEL_FILL).draw(screen)
         # Title — center of top quarter (matches the 1/4, 1/2, 3/4
-        # row layout used for the buttons)
+        # row layout used for the buttons). "TIME UP" for truncation,
+        # "YOU DIED" for collision — matches _run_death_modal's sizing.
+        is_truncated = getattr(self, "death_reason", "collision") == "truncated"
+        title_str = "TIME UP" if is_truncated else "YOU DIED"
         try:
-            t = render_text_pil("YOU DIED", font_size=44, color=BLACK)
+            t = render_text_pil(title_str, font_size=44, color=BLACK)
             title_y = modal.rect.top + modal.rect.height // 4
             screen.blit(t, t.get_rect(center=(modal.rect.centerx, title_y)))
         except Exception:

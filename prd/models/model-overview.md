@@ -75,9 +75,19 @@ def calculate_reward(old_head, new_head, food_eaten, collision):
 ### PPO Architecture Diagram
 
 ```
-[Input: Spatiotemporal Tensor]
-     Shape: (4, 20, 20)
-  (Wall, Body, Static, Dynamic)
+[Input: Spatiotemporal Tensor v2]
+     Shape: (8, 20, 20)
+  Ch0 Wall          | Ch4  Head dir       (1.0 at cell 1 step in current
+  Ch1 Decaying body |                        direction)
+  Ch2 Static food   | Ch5  Food direction (1.0 at the 4 cells around the
+  Ch3 Dynamic food       head in any direction where SOME food exists;
+        (1.0 current,    mirrors 12-bit obs's Bits 8-11)
+         0.5 previous) | Ch6  Relative danger(1.0 at the 3 cells STRAIGHT /
+                                          LEFT / RIGHT of head — relative
+                                          to current heading — if wall or
+                                          body; "behind" omitted since 180°
+                                          reversal is impossible)
+                    | Ch7  Snake length   (broadcast len/400 everywhere)
              |
              v
 +-----------------------------+
@@ -87,6 +97,14 @@ def calculate_reward(old_head, new_head, food_eaten, collision):
 | - Conv2D Layer (ReLU)       |
 | - Flatten()                 |
 +-----------------------------+
+
+# Catatan: legacy 4-channel v1 obs (Wall, Body, Static, Dynamic) masih
+# didukung via `obs_type="spatiotemporal_legacy"` agar model lama tidak
+# rusak. Layout v2 menambahkan head direction, food direction, relative
+# danger (3 sel relative to heading), dan snake length di atas 4 ch v1.
+# Ch3 (dynamic food per-cell map dengan 1.0 current + 0.5 previous) adalah
+# sinyal penting untuk level 3-4 yang makanan dinamis adalah satu-satunya
+# target — tanpa channel ini, agen hanya punya directional signal di Ch5.
              |
       [Feature Vector]
              |

@@ -8,13 +8,15 @@ PPO via the `policy_kwargs={"features_extractor_class": ...}` hook.
 
 Pipeline
 --------
-    Input tensor (B, 4, 20, 20)
-        │  (Wall | DecayingBody | StaticFood | DynamicMomentum)
+    Input tensor (B, C, 20, 20)  — C is read from ``observation_space.shape[0]``
+        │  C=4 (legacy) : (Wall | DecayingBody | StaticFood | DynamicMomentum)
+        │  C=8 (v2)     : 4 above + (HeadDir | FoodDir | RelativeDanger
+        │                 | SnakeLen)
         ▼
     +-----------------------------+
     |  SPATIAL EXTRACTOR (CNN)    |  2 × Conv2d(ReLU) + Flatten
     +-----------------------------+
-        │  (B, 64, 20, 20) flattened → (B, 64, 400)
+        │  (B, cnn_channels, 20, 20) flattened → (B, cnn_channels, 400)
         ▼
     +-----------------------------+
     |  TEMPORAL ATTENTION         |  1 × TransformerEncoder
@@ -59,7 +61,11 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
     CNN spatial encoder + Transformer temporal attention.
 
     Args:
-        observation_space: SB3 observation space (Box of shape (4, 20, 20)).
+        observation_space: SB3 observation space (Box of shape (C, 20, 20)).
+                           The number of input channels ``C`` is read from
+                           ``observation_space.shape[0]`` and is forwarded
+                           to the first Conv2d — supports both the 4-channel
+                           v1 obs and the 8-channel v2 obs.
         cnn_channels:      Output channels of the two Conv2d layers.
         d_model:           Transformer embedding / hidden size.
         n_heads:           Number of attention heads.
@@ -73,19 +79,26 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
     def __init__(
         self,
         observation_space,
-        cnn_channels: int = 32,
-        d_model: int = 64,
-        n_heads: int = 4,
+        cnn_channels: int = 64,
+        d_model: int = 128,
+        n_heads: int = 8,
         dropout: float = 0.0,
-        use_attention: bool = False,
+        use_attention: bool = True,
     ):
-        # The grid is 20×20, 4 channels → after two stride-1 convs the
-        # spatial size is preserved, so flattened length is cnn_channels*20*20.
+        # The grid is 20×20, C input channels (4 for v1 legacy, 8 for v2) →
+        # after two stride-1 convs the spatial size is preserved, so the
+        # flattened length is cnn_channels*20*20 regardless of C.
         super().__init__(observation_space, features_dim=d_model)
 
         self.use_attention = use_attention
         self.grid_h: int = observation_space.shape[1]
         self.grid_w: int = observation_space.shape[2]
+        # Read the input channel count from the obs space so the same
+        # extractor works for the 4-channel legacy obs AND the 10-channel
+        # v2 obs. SB3 only constructs the extractor once per env, so the
+        # mismatch failure mode for a wrong-shape model is caught at
+        # load time, not silently mid-training.
+        self.in_channels: int = int(observation_space.shape[0])
         self.cnn_channels: int = cnn_channels
         self.d_model: int = d_model
 
@@ -93,7 +106,7 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
         # 1. Spatial Extractor — two Conv2d + ReLU, no pooling (preserve grid)
         # ----------------------------------------------------------------
         self.spatial = nn.Sequential(
-            nn.Conv2d(4, cnn_channels, kernel_size=3, padding=1),
+            nn.Conv2d(self.in_channels, cnn_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -147,12 +160,14 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            observations: Tensor of shape (B, 4, 20, 20), float32.
+            observations: Tensor of shape (B, C, 20, 20), float32, where
+                          ``C`` matches the env's obs space (4 for legacy
+                          v1 obs, 8 for v2 obs).
         Returns:
             Context vector of shape (B, features_dim).
         """
         # 1. Spatial encoding
-        x = self.spatial(observations)              # (B, C, H, W)
+        x = self.spatial(observations)              # (B, cnn_channels, H, W)
         b, c, h, w = x.shape
         tokens = x.permute(0, 2, 3, 1).reshape(b, h * w, c)  # (B, H*W, C)
 
