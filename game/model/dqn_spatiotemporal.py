@@ -22,15 +22,17 @@ Pipeline
         │                                          | StaticFood | DynamicMomentum
         ▼
     +-----------------------------+
-    |  SPATIAL EXTRACTOR (CNN)    |  2 × Conv2d(ReLU)
+    |  SPATIAL EXTRACTOR (CNN)    |  2 × stride-2 Conv2d(ReLU)
+    |  (compact, downsamples)     |  20×20 → 10×10 → 5×5
     +-----------------------------+
-        │  (B, cnn_channels, 20, 20)
+        │  (B, cnn_channels, 5, 5) flattened → (B, 25, cnn_channels)
+        │  Each of the 25 tokens covers a 4×4 region with a 7×7 RF.
         ▼
     +-----------------------------+
     |  TEMPORAL ATTENTION         |  1 × TransformerEncoder
-    |  (Multi-Head Attention)     |
+    |  (Multi-Head Attention)     |  over 25 tokens + 1 learnable [CLS]
     +-----------------------------+
-        │  (B, 400, d_model) → CLS-pool → (B, d_model)
+        │  (B, 26, d_model) → CLS-pool → (B, d_model)
         ▼
     Context vector  (features_dim = d_model)
         │

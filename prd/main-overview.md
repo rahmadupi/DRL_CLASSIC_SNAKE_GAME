@@ -71,12 +71,14 @@ root/
 
 Tabel ini adalah ringkasan _run-of-show_ proyek setelah refactor terbaru. Setiap sel bisa dijalankan dari TUI launcher dengan memilih kombinasi `Algorithm` × `Obs Type` yang sesuai.
 
-| Algorithm ↓ / Obs → | **12bit** (MLP, 12-dim vector)                                 | **spatiotemporal** (CNN+Attention, 4×20×20 honest layout)                                                  |
+| Algorithm ↓ / Obs → | **12bit** (MLP, 12-dim vector)                                 | **spatiotemporal** (compact CNN + 25-token Attention, 4×20×20 honest layout)                               |
 | ------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| **PPO**             | `ppo_12bit.py` — `DQN12BitExtractor` + actor/critic head       | `ppo_spatiotemporal.py` — `SpatiotemporalExtractor` (CNN + Transformer) + actor/critic head                |
-| **DQN**             | `dqn_12bit.py` — `DQN12BitExtractor` + Q-head (baseline paper) | `dqn_spatiotemporal.py` — `SpatiotemporalExtractor` + Q-head (CNN-only ablation via `use_attention=False`) |
+| **PPO**             | `ppo_12bit.py` — `DQN12BitExtractor` + actor/critic head       | `ppo_spatiotemporal.py` — `SpatiotemporalExtractor` (stride-2 CNN + Transformer) + actor/critic head       |
+| **DQN**             | `dqn_12bit.py` — `DQN12BitExtractor` + Q-head (baseline paper) | `dqn_spatiotemporal.py` — `SpatiotemporalExtractor` + Q-head (CNN-only ablation via `use_attention=false`) |
 
 **Mengapa dua-duanya?** Eksperimen awal hanya membandingkan PPO-Sptmp vs DQN-12bit, yang mencampurdua faktor arsitektur dengan faktor algoritma. Varian tambahan (PPO-12bit dan DQN-Sptmp) mengisolasi masing-masing faktor sehingga perbandingan apples-to-apples — lihat `prd/models/model-overview.md` untuk diagram pipeline lengkap dan `prd/models/train.md` untuk cara memilihnya di TUI.
+
+**Varian "compact" spatiotemporal.** `SpatiotemporalExtractor` saat ini menggunakan 2× stride-2 Conv2d (downsampling 20×20 → 5×5) sehingga Transformer beroperasi pada 25 token (bukan 400). Trade-off: receptive field per token naik dari 5×5 ke 7×7 di input space, biaya attention turun ~240×. Detail di `prd/models/model-overview.md § Proposed Model`. Default `use_attention=true` di kedua JSON config; ablation CNN-only dijalankan per-run lewat override dari TUI launcher.
 
 ## Skema Penamaan Model (versi baru)
 

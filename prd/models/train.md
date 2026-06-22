@@ -164,8 +164,10 @@ total_timesteps = max(2_048, cfg.episodes * 2_048) if cfg.episodes > 0 else 200_
 
 Field tambahan spesifik algoritma (saat ini nilainya di JSON):
 
-- **PPO**: `n_steps=2048`, `batch_size=256`, `n_epochs=9`, `gae_lambda=0.95`, `clip_range=0.2`, `ent_coef=0.018`, `vf_coef=0.4`, `max_grad_norm=0.5`, `cnn_channels=32`, `d_model=64`, `n_heads=8`, `dropout=0.1`, `use_attention=True`, `net_arch_pi=[64]`, `net_arch_vf=[64]`.
+- **PPO**: `n_steps=2048`, `batch_size=256`, `n_epochs=4`, `gae_lambda=0.95`, `clip_range=0.2`, `clip_range_vf=0.2`, `ent_coef=0.01`, `vf_coef=0.4`, `max_grad_norm=0.5`, `cnn_channels=32`, `d_model=64`, `n_heads=4`, `dropout=0.1`, `use_attention=True`, `net_arch_pi=[64]`, `net_arch_vf=[64]`.
 - **DQN**: `buffer_size=100_000`, `learning_starts=1_000` (0 saat _resume_), `batch_size=64`, `gamma=0.99`, `tau=1.0`, `train_freq=4`, `gradient_steps=1`, `target_update_interval=1_000`, `exploration_fraction=0.1`, `exploration_initial_eps=1.0`, `exploration_final_eps=0.05`, `hidden_dim=64`, `features_dim=64`, `cnn_channels=32`, `d_model=64`, `n_heads=8`, `use_attention=True`.
+
+> **`clip_range_vf`** adalah trust-region clip pada value head (critic), bukan policy. Sama seperti `clip_range` mencegah policy drift, `clip_range_vf` mencegah value head dari "diyakin-yakinkan" oleh outlier return dalam satu update. Tanpa itu, value function bisa diverge (`explained_variance` turun, `value_loss` naik) — yang kemudian membuat GAE advantages jadi noisi dan policy gradient tidak stabil. Default 0.2 di config PPO.
 
 > **Cara edit**: buka JSON di `game/model/configs/`, ubah nilai, simpan. Tidak perlu restart apa-apa — JSON dibaca ulang tiap kali `_from_json_dict()` dipanggil (yaitu di awal setiap run).
 
@@ -206,28 +208,60 @@ Empat direktori di atas adalah run terpisah di TensorBoard — bisa dibandingkan
   - `obs_type ∈ {"spatiotemporal", "spatiotemporal_legacy"}` → factory CNN+Attention yang membaca channel count dari `observation_space.shape[0]` (saat ini selalu 4-channel honest layout).
 - **Resume**: panggil `PPO.load()` / `DQN.load()` dengan `custom_objects={"learning_rate": ...}` agar schedule LR dapat di-override per-stage curriculum. Setelah `load()`, kedua trainer men-override `model.lr_schedule` (PPO juga `model.clip_range`) lewat helper bersama `build_lr_schedule(...)` di `game/train/utility.py`. Lihat §LR Schedule di bawah untuk motivasi linear decay.
 
-### LR & Clip-Range Schedule (Linear Decay)
+### LR & Clip-Range Schedule
 
-Kedua algoritma (PPO dan DQN) memakai **linear decay** terhadap `learning_rate` — dan PPO juga terhadap `clip_range` — mengikuti recipe asli PPO (Schulman et al. 2017). Helper bersama [`build_lr_schedule(learning_rate, use_linear, end_fraction)`](../../game/train/utility.py) membungkus SB3 `get_linear_fn(...)` / `get_schedule_fn(...)` dan dipakai oleh `build_ppo()` maupun `build_dqn()`.
+PPO dan DQN mendukung dua mode schedule lewat `use_linear_schedule`:
 
-| Field                 | Default | Arti                                                            |
-| --------------------- | ------- | --------------------------------------------------------------- |
-| `use_linear_schedule` | `True`  | `True` → linear decay; `False` → konstan                        |
-| `lr_end_fraction`     | varies  | LR akhir = `learning_rate × lr_end_fraction` (`0.0` = 0)        |
-| `clip_end_fraction`   | varies  | clip_range akhir = `clip_range × clip_end_fraction`. Hanya PPO. |
+- **`use_linear_schedule=true`** → linear decay dari `learning_rate` ke `learning_rate × lr_end_fraction` selama run. PPO juga men-decay `clip_range` ke `clip_range × clip_end_fraction` (terkontrol via `clip_end_fraction`).
+- **`use_linear_schedule=false`** → konstan selama run (schedule_fn dari SB3).
 
-Default nilai di JSON:
+Helper bersama [`build_lr_schedule(learning_rate, use_linear, end_fraction)`](../../game/train/utility.py) membungkus SB3 `get_linear_fn(...)` / `get_schedule_fn(...)` dan dipakai oleh `build_ppo()` maupun `build_dqn()`. PPO punya helper setara [`_build_clip_schedule`](../../game/train/ppo_trainer.py).
 
-| Algoritma | `lr_end_fraction` | `clip_end_fraction` |
-| --------- | ----------------- | ------------------- |
-| PPO       | `0.1`             | `0.05`              |
-| DQN       | `0.0`             | —                   |
+| Field                 | Default (saat ini) | Arti                                                                     |
+| --------------------- | ------------------ | ------------------------------------------------------------------------ |
+| `use_linear_schedule` | `true`             | `true` → linear decay; `false` → konstan sepanjang run                   |
+| `lr_end_fraction`     | `0.1`              | LR akhir = `learning_rate × lr_end_fraction` (hanya relevan jika linear) |
+| `clip_end_fraction`   | `1.0`              | clip_range akhir = `clip_range × clip_end_fraction`. Hanya PPO.          |
 
-**Mengapa linear decay (bukan konstan)?** Schedule konstan pada policy yang sudah matang membuat optimizer terus membuat update besar dan "mengetuk" policy keluar dari region bagus — gejala yang muncul sebagai osilasi reward di akhir pelatihan (sekitar 500k–700k step pada run PPO Level 1). Decay linear mengecilkan step size seiring policy konvergen sehingga osilasi mereda. Untuk kembali ke schedule konstan, set `use_linear_schedule=False` di config (atau turunkan `learning_rate` manual saat resume).
+**Default config saat ini**: `learning_rate=5e-5`, `use_linear_schedule=true`, `lr_end_fraction=0.1`, `clip_end_fraction=1.0`. Artinya:
 
-**Override saat resume.** SB3 menyimpan schedule sebagai callable pada `model.lr_schedule` (dan `model.clip_range` untuk PPO). `PPO.load()` / `DQN.load()` me-restore schedule dari checkpoint — agar curriculum run dapat mengubah LR per-stage, kedua builder secara eksplisit men-override schedule tersebut setelah `load()`.
+- LR decays 5e-5 → 5e-6 selama 500k steps (linear)
+- clip_range **konstan** di 0.2 selama run
+
+**Mengapa LR masih decay, tapi clip_range konstan?** Snake punya tiga karakteristik yang membuat linear decay LR saja problematik:
+
+1. **Sparse reward** — event `+10`/`-10` sangat jarang (~300 langkah per makanan). Gradient signal yang sampai ke optimizer sudah noisy; LR decay mengecilkan langkah di akhir run, membantu **fine-tune** tanpa overshooting.
+2. **Small network (~75k params)** — model kecil mudah "overshoot" region bagus dalam satu update besar. Decay LR memberikan margin.
+3. **Late-game fine-tuning** — setelah policy menemukan region bagus, decay membantu settle tanpa fluktuasi besar.
+
+Tapi **`clip_range` decay harus dihindari**. Run PPO Level 1 sebelumnya (LR 1e-4 → 1e-5, clip_range 0.2 → 0.01) menunjukkan pola klasik: **peak performance** di iter ~24 (`eating_rate=0.98`), lalu **crash** di iter 27 (`eating_rate=0.41`) ketika `clip_range` sudah cukup kecil (0.115) untuk "menjepit" policy ke update yang noisy. `clip_end_fraction=1.0` memutus pola ini dengan menjaga trust region tetap longgar sepanjang run.
+
+**Kapan linear decay penuh (LR + clip_range) masih berguna?** Untuk **fine-tuning** model yang sudah konvergen, di mana policy benar-benar stabil. Workflow dua tahap: (1) train dengan LR-decay + clip_range-konstan sampai converged, (2) resume dengan `clip_end_fraction` lebih kecil (mis. 0.5) untuk fine-tune.
+
+**Override saat resume.** SB3 menyimpan schedule sebagai callable pada `model.lr_schedule` (dan `model.clip_range` untuk PPO). `PPO.load()` / `DQN.load()` me-restore schedule dari checkpoint — agar curriculum run dapat mengubah LR per-stage, kedua builder secara eksplisit men-override schedule tersebut setelah `load()`. `clip_range_vf` juga di-restore via `custom_objects` agar resumed run memakai nilai baru.
 
 **`reset_num_timesteps` pada resume.** Schedule linear mensyaratkan `progress_remaining` walk dari 1.0 → 0.0 selama run baru. `train_ppo()` dan `train_dqn()` memaksa `reset_num_timesteps=True` ketika `use_linear_schedule=True`; jika konstan, default `reset_num_timesteps=(load_path is None)` dipertahankan agar sumbu-X TensorBoard tetap kontinu lintas run.
+
+### Trust-Region pada Value Head (`clip_range_vf`)
+
+PPO memakai `clip_range` untuk menjaga policy update dalam trust region di sekitar policy lama. Tapi **value head (critic)** di-update terpisah, secara default dengan MSE loss tanpa clipping. Pada Snake, return episode sangat bervariasi (long survival → return besar; quick death → return kecil), dan outlier ini bisa "menyentil" value head dalam satu update.
+
+`clip_range_vf` (parameter SB3 PPO, default None = tidak ada clipping) menerapkan trust region yang sama pada value update:
+
+```
+values_clipped = value_old + clip(value_new − value_old, −clip_range_vf, +clip_range_vf)
+value_loss = max(MSE(value_new, returns), MSE(values_clipped, returns))
+```
+
+Default `clip_range_vf=0.2` di `ppo_config.json`. Indikator bahwa ia bekerja:
+
+| Signal               | Tanpa `clip_range_vf`    | Dengan `clip_range_vf=0.2`       |
+| -------------------- | ------------------------ | -------------------------------- |
+| `value_loss`         | Bisa spike / climb       | Stabil, gradual changes          |
+| `explained_variance` | Drop terus (0.5 → 0.3)   | Stabil di atas 0.4 sepanjang run |
+| `clip_fraction`      | Naik (policy divergence) | Stabil / turun                   |
+
+Feedback loop positif tanpa `clip_range_vf`: value function diverge → GAE advantages noisi → policy gradient noisi → value function diverge lagi. Mengaktifkan `clip_range_vf` memutus loop ini sejak awal.
 
 ### Langkah 4 — Checkpoint Callback
 

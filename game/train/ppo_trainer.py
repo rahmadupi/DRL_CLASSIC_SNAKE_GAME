@@ -109,6 +109,14 @@ class PPOTrainingConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
+    # Trust-region clip on the value (critic) head. Mirrors `clip_range`
+    # but on the value function: stops the critic from being yanked
+    # around by outlier returns in a single update. Without it, the
+    # value function can diverge (explained_variance falling,
+    # value_loss climbing), which in turn makes GAE advantages noisy
+    # and destabilises the policy gradient — the feedback loop you
+    # saw in the mass_ppo_sptmp run (iter 24 peak → iter 27 crash).
+    clip_range_vf: float = 0.2
     ent_coef: float = 0.05
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
@@ -255,9 +263,16 @@ def build_ppo(
             env=env,
             device=config.device,
             tensorboard_log=str(tensorboard_log) if tensorboard_log else None,
-            # When resuming, SB3 re-uses the saved lr_schedule. Force the
-            # new schedule so curriculum runs can change the lr per stage.
-            custom_objects={"learning_rate": config.learning_rate},
+            # When resuming, SB3 re-uses the saved lr_schedule and the
+            # saved clip_range_vf. Force the new values so curriculum
+            # runs can change the LR per stage AND pick up the trust-
+            # region clip on the value head (otherwise models trained
+            # before this option existed will load with clip_range_vf=None
+            # and the value head will run un-clipped).
+            custom_objects={
+                "learning_rate": config.learning_rate,
+                "clip_range_vf": config.clip_range_vf,
+            },
         )
         # Override BOTH schedules on the loaded model. SB3 reads
         # ``model.lr_schedule`` and ``model.clip_range`` on every step
@@ -265,6 +280,7 @@ def build_ppo(
         # them here replaces the previously-saved schedule cleanly.
         model.lr_schedule = lr_schedule
         model.clip_range = clip_schedule
+        model.clip_range_vf = config.clip_range_vf
         return model
 
     return PPO(
@@ -278,6 +294,7 @@ def build_ppo(
         gamma=config.gamma,
         gae_lambda=config.gae_lambda,
         clip_range=clip_schedule,
+        clip_range_vf=config.clip_range_vf,
         ent_coef=config.ent_coef,
         vf_coef=config.vf_coef,
         max_grad_norm=config.max_grad_norm,

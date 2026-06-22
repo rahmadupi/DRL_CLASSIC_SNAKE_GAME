@@ -15,8 +15,12 @@ Kedua `SpatiototemporalExtractor` (PPO & DQN) **identik secara byte-per-byte** k
 
 Algoritma PPO (_On-Policy_) dipilih untuk menghindari _memory leak_ dari _Replay Buffer_ DQN saat memproses tensor matriks masif.
 
-- **Spatial Extractor:** 2 layer Conv2D + ReLU. Mengekstrak relasi geometrik lokal dari tensor 20×20×4 (honest layout — Ch0 Wall, Ch1 Decaying body, Ch2 Static food, Ch3 Dynamic food).
-- **Temporal Attention:** 1 layer Transformer Encoder (_Multi-Head Attention_) di atas 400 sel spasial + 1 learnable `[CLS]` token. Menghitung prioritas lintas-trajektori target dinamis.
+- **Spatial Extractor (compact):** 2 layer **stride-2 Conv2D + ReLU**. Input 20×20×4 (honest layout — Ch0 Wall, Ch1 Decaying body, Ch2 Static food, Ch3 Dynamic food) didownsample 20×20 → 10×10 → 5×5. Setiap token output punya **7×7 receptive field** di input space (vs. 5×5 pada varian stride-1 lama). Trade-off: lebih besar RF per token, 16× lebih sedikit token untuk attention.
+- **Temporal Attention (compact):** 1 layer Transformer Encoder (_Multi-Head Attention_) di atas **25 token spasial** (5×5) + 1 learnable `[CLS]` token. Biaya attention: 26² ≈ 676 scores per sample — sekitar 240× lebih murah dari varian 400-token lama (401² ≈ 160k scores), tanpa kehilangan kemampuan penalaran global lintas papan.
+
+### Mengapa compact (strided CNN + sedikit token)?
+
+Varian lama (stride-1, 400 token) membengkak karena setiap sel grid menjadi token attention terpisah. Mayoritas token itu tetangga spatialnya yang sudah bisa di-capture CNN lokal; Transformer jadi belajar ulang hubungan adjacent yang sebenarnya _spatial bias_-nya sudah hilang. Stride-2 CNN memaksa representasi spasial untuk **dikompresi secara hierarkis** dulu — tiap token 5×5 berisi informasi tentang region 4×4 input dengan RF 7×7 — sehingga Transformer cukup fokus pada **relasi global** (food position vs body trap vs open area) yang betul-betul perlu penalaran attention.
 
 ## 2. Baseline Model: DQN 12-bit (Paper Replication)
 
@@ -28,7 +32,7 @@ PPO + MLP 12-bit memvalidasi apakah PPO sendirian sudah cukup untuk menutup gap 
 
 ## 4. DQN Spatiotemporal (algoritma baseline, state modern)
 
-DQN + CNN+Attention memvalidasi apakah representasi spasial modern membantu _off-policy_ learning. Features extractor di-reuse dari PPO (lihat §1), hanya head-nya diganti dari actor/critic ke Q-head. Flag `use_attention=False` mengaktifkan ablation CNN-only untuk percobaan isolated.
+DQN + CNN+Attention (compact, sama dengan PPO) memvalidasi apakah representasi spasial modern membantu _off-policy_ learning. Features extractor di-reuse dari PPO (lihat §1), hanya head-nya diganti dari actor/critic ke Q-head. Flag `use_attention=False` mengaktifkan ablation CNN-only (5×5 flatten → MLP, tanpa Transformer) untuk percobaan isolated — default config sekarang `use_attention=true`; ablation dilakukan dengan override per-run dari TUI launcher.
 
 ## Rancangan Eksperimen
 
@@ -111,14 +115,16 @@ def calculate_reward(old_head, new_head, food_eaten, collision):
                      momentum marker critical on levels 3-4)
              |
              v
-+-----------------------------+
-|   SPATIAL EXTRACTOR (CNN)   |
-|-----------------------------|
-| - Conv2D Layer (ReLU)       |
-| - Conv2D Layer (ReLU)       |
-| - Flatten()                 |
-+-----------------------------+
-
++----------------------------------------+
+|   COMPACT SPATIAL EXTRACTOR (CNN)      |
+|----------------------------------------|
+| - Conv2D(stride=2) Layer (ReLU)        |  20×20 → 10×10
+| - Conv2D(stride=2) Layer (ReLU)        |  10×10 →  5×5
++----------------------------------------+
+# Setiap token output 5×5 punya receptive field 7×7 di input.
+# Bandingkan dengan varian lama (stride=1, 20×20 output): RF 5×5
+# per token tapi 400 token (16× lebih banyak) dibutuhkan attention.
+#
 # Layout v2 sebelumnya (8 ch dengan head dir, food dir, danger,
 # snake-length broadcast) sudah dihapus — itu semua adalah _heuristic
 # crutches_ yang membuat jaringan membaca jawabannya secara langsung
@@ -128,18 +134,21 @@ def calculate_reward(old_head, new_head, food_eaten, collision):
 # satu-satunya target — tanpa marker momentum ini, agen tidak punya
 # cara mengetahui ke arah mana makanan bergerak.
              |
-      [Feature Vector]
+      [25 tokens × 32-dim]   ← (B, 25, 32) setelah flatten spatial
              |
              v
-+-----------------------------+
-| TEMPORAL ATTENTION MODULE   |
-|-----------------------------|
-| - Transformer Encoder       |
-| - Multi-Head Attention      |
-| - Feed-Forward Network      |
-+-----------------------------+
++----------------------------------------+
+| TEMPORAL ATTENTION MODULE              |
+|----------------------------------------|
+| - Linear(32 → 64) cell embedding       |
+| - Learnable [CLS] token prepended      |  → (B, 26, 64)
+| - Transformer Encoder (1 layer)        |
+|   • Multi-Head Attention (4 heads)     |  26² = 676 attention scores
+|   • Feed-Forward Network (256-dim)     |
+| - Linear(64 → 64) output projection    |
++----------------------------------------+
              |
-      [Context Vector]
+      [Context Vector]  (B, 64)
              |
       +------+------+
       |             |
@@ -198,20 +207,24 @@ MLP features extractor di-reuse dari `dqn_12bit.py` (3 layer Dense, identik deng
      Shape: (4, 20, 20)
              |
              v
-+-----------------------------+
-|   SPATIAL EXTRACTOR (CNN)   |  (Sama dengan PPO sptmp)
-|-----------------------------|
-| - Conv2D Layer (ReLU)       |
-| - Conv2D Layer (ReLU)       |
-+-----------------------------+
++----------------------------------------+
+|   COMPACT SPATIAL EXTRACTOR (CNN)      |  (Sama dengan PPO sptmp)
+|----------------------------------------|
+| - Conv2D(stride=2) Layer (ReLU)        |  20×20 → 10×10
+| - Conv2D(stride=2) Layer (ReLU)        |  10×10 →  5×5
++----------------------------------------+
+             |
+      [25 tokens × 32-dim]   ← (B, 25, 32)
              |
              v
-+-----------------------------+
-| TEMPORAL ATTENTION MODULE   |  (Sama dengan PPO sptmp)
-|-----------------------------|
-| - Transformer Encoder       |
-| - Multi-Head Attention      |
-+-----------------------------+
++----------------------------------------+
+| TEMPORAL ATTENTION MODULE              |  (Sama dengan PPO sptmp)
+|----------------------------------------|
+| - Linear(32 → 64) cell embedding       |
+| - Learnable [CLS] token prepended      |
+| - Transformer Encoder (1 layer, 8 hd)  |
+| - Linear(64 → 64) output projection    |
++----------------------------------------+
              |
       [Context Vector]  (B, 64)
              |
@@ -231,7 +244,7 @@ MLP features extractor di-reuse dari `dqn_12bit.py` (3 layer Dense, identik deng
        Greedy Action
 ```
 
-> `use_attention=False` (toggle di [`dqn_config.json`](../../game/model/configs/dqn_config.json) atau lewat trainer) menonaktifkan blok Temporal Attention dan menggantinya dengan flatten+Linear langsung dari output CNN — itulah _architecture ablation_ yang bisa dijalankan identik pada PPO maupun DQN.
+> `use_attention=False` (toggle di [`dqn_config.json`](../../game/model/configs/dqn_config.json) atau lewat trainer) menonaktifkan blok Temporal Attention dan menggantinya dengan flatten+Linear langsung dari output 5×5 CNN — itulah _architecture ablation_ yang bisa dijalankan identik pada PPO maupun DQN. **Default config sekarang `use_attention=true`**; ablation dilakukan via override per-run dari TUI launcher.
 
 ### DQN 12-bit Architecture Diagram
 

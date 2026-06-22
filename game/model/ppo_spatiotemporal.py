@@ -13,15 +13,20 @@ Pipeline
         │                                          | StaticFood | DynamicMomentum
         ▼
     +-----------------------------+
-    |  SPATIAL EXTRACTOR (CNN)    |  2 × Conv2d(ReLU) + Flatten
+    |  SPATIAL EXTRACTOR (CNN)    |  2 × stride-2 Conv2d(ReLU)
+    |  (compact, downsamples)     |  20×20 → 10×10 → 5×5
     +-----------------------------+
-        │  (B, cnn_channels, 20, 20) flattened → (B, cnn_channels, 400)
+        │  (B, cnn_channels, 5, 5) flattened → (B, 25, cnn_channels)
+        │  Each of the 25 tokens covers a 4×4 region of the input grid
+        │  with a 7×7 receptive field in input space (vs. 5×5 with the
+        │  old stride-1 / 400-token variant).
         ▼
     +-----------------------------+
     |  TEMPORAL ATTENTION         |  1 × TransformerEncoder
-    |  (Multi-Head Attention)     |
+    |  (Multi-Head Attention)     |  over 25 tokens + 1 learnable [CLS]
     +-----------------------------+
-        │  (B, 400, d_model) → CLS-pool → (B, d_model)
+        │  (B, 25, d_model) → CLS-pool → (B, d_model)
+        │  Attention cost: 26² ≈ 676 scores  (vs. 401² ≈ 160k before)
         ▼
     Context vector  (features_dim = d_model)
         │
@@ -53,14 +58,22 @@ the underlying geometry from the raw channels:
 Removing them is what makes the PPO↔DQN and 12-bit↔spatiotemporal
 comparisons measure the algorithms, not the cheat-sheet.
 
-Why a Transformer over a flat MLP?
-----------------------------------
+Why a *compact* Transformer over a flat MLP?
+---------------------------------------------
 * The 4-channel grid encodes *where* obstacles and food are *right now*.
   The transformer allows the actor to weigh *which spatial locations*
   are most informative given the rest of the grid (e.g. food cells
   adjacent to the head, body segments forming a choke-point).
 * A learnable [CLS]-style token is prepended so pooling has a
   dedicated attention sink rather than averaging noisy spatial tokens.
+* **Why stride-2 downsampling first?** Two stride-2 Conv2d layers compress
+  the 20×20 grid to 5×5, yielding 25 spatial tokens (not 400). Each
+  token covers a 4×4 region with a 7×7 receptive field in input space
+  — enough local context that the network doesn't have to "re-discover"
+  spatial adjacency inside the attention block. Attention cost drops from
+  O(401²) ≈ 160k scores to O(26²) ≈ 676 scores (~240× cheaper), making
+  the spatiotemporal model feasible for CPU training without sacrificing
+  global reasoning across the board.
 """
 
 from __future__ import annotations
@@ -101,9 +114,12 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
         dropout: float = 0.0,
         use_attention: bool = True,
     ):
-        # The grid is 20×20, C input channels (currently always 4) →
-        # after two stride-1 convs the spatial size is preserved, so the
-        # flattened length is cnn_channels*20*20 regardless of C.
+        # The grid is 20×20, C input channels (currently always 4).
+        # After two stride-2 Conv2d layers with kernel=3, padding=1, the
+        # spatial size halves each step: 20 → 10 → 5. General formula
+        # for one Conv2d layer: out = floor((H + 2P − K) / S) + 1.
+        # The 25 output tokens are what the Transformer attends over,
+        # which is the whole point of the "compact attention" refactor.
         super().__init__(observation_space, features_dim=d_model)
 
         self.use_attention = use_attention
@@ -119,17 +135,33 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
         self.d_model: int = d_model
 
         # ----------------------------------------------------------------
-        # 1. Spatial Extractor — two Conv2d + ReLU, no pooling (preserve grid)
+        # 1. Spatial Extractor — two STRIDE-2 Conv2d + ReLU
+        #    Downsamples 20×20 → 10×10 → 5×5. Each output token covers
+        #    a 4×4 input region with a 7×7 receptive field in input
+        #    space — bigger than the 5×5 RF the old stride-1 / 400-token
+        #    variant gave, but with ~16× fewer tokens for attention.
         # ----------------------------------------------------------------
         self.spatial = nn.Sequential(
-            nn.Conv2d(self.in_channels, cnn_channels, kernel_size=3, padding=1),
+            nn.Conv2d(self.in_channels, cnn_channels, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, padding=1),
+            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
         )
 
+        # Compute the post-conv spatial size analytically so the
+        # no-attention ablation's flatten projection is sized correctly.
+        # 20 → floor((20+2−3)/2)+1 = 10 → floor((10+2−3)/2)+1 = 5.
+        spatial_out_h = self.grid_h
+        spatial_out_w = self.grid_w
+        for _ in range(2):  # two stride-2 Conv2d layers
+            spatial_out_h = (spatial_out_h + 2 - 3) // 2 + 1
+            spatial_out_w = (spatial_out_w + 2 - 3) // 2 + 1
+        self.spatial_out_h: int = spatial_out_h
+        self.spatial_out_w: int = spatial_out_w
+        self.spatial_out_size: int = spatial_out_h * spatial_out_w  # 25 for 20×20 input
+
         # ----------------------------------------------------------------
-        # 2. Temporal Attention — 1 Transformer encoder block
+        # 2. Temporal Attention — 1 Transformer encoder block over 25 tokens
         # ----------------------------------------------------------------
         if use_attention:
             # Project each spatial cell into d_model dims
@@ -160,12 +192,15 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
             # Final projection keeps features_dim == d_model
             self.out_proj = nn.Linear(d_model, d_model)
         else:
-            # Ablation path — flatten CNN output straight into a d_model vec
+            # Ablation path — flatten CNN output straight into a d_model vec.
+            # Uses the post-conv flattened size (25 for 20×20 input), NOT
+            # the input grid size, since the strided convs have already
+            # compressed the spatial dims.
             self.cell_embed = None
             self.cls_token = None
             self.transformer = None
             self.out_proj = nn.Sequential(
-                nn.Linear(cnn_channels * self.grid_h * self.grid_w, d_model),
+                nn.Linear(cnn_channels * self.spatial_out_size, d_model),
                 nn.ReLU(inplace=True),
                 nn.Linear(d_model, d_model),
             )
@@ -183,21 +218,27 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
         Returns:
             Context vector of shape (B, features_dim).
         """
-        # 1. Spatial encoding
-        x = self.spatial(observations)              # (B, cnn_channels, H, W)
+        # 1. Spatial encoding — two stride-2 convs compress the 20×20
+        #    grid down to 5×5, yielding 25 spatial tokens. Each token
+        #    covers a 4×4 region of the input grid with a 7×7 receptive
+        #    field. ``h`` and ``w`` are read from the actual output shape
+        #    so this method works for any input grid size.
+        x = self.spatial(observations)              # (B, cnn_channels, h, w)  h=w=5
         b, c, h, w = x.shape
-        tokens = x.permute(0, 2, 3, 1).reshape(b, h * w, c)  # (B, H*W, C)
+        tokens = x.permute(0, 2, 3, 1).reshape(b, h * w, c)  # (B, 25, cnn_channels)
 
         if not self.use_attention:
             return self.out_proj(tokens.reshape(b, -1))
 
         # 2. Embed to d_model and prepend CLS token
-        tokens = self.cell_embed(tokens)             # (B, H*W, d_model)
+        tokens = self.cell_embed(tokens)             # (B, 25, d_model)
         cls = self.cls_token.expand(b, -1, -1)       # (B, 1, d_model)
-        seq = torch.cat([cls, tokens], dim=1)        # (B, 1 + H*W, d_model)
+        seq = torch.cat([cls, tokens], dim=1)        # (B, 26, d_model)
 
-        # 3. Self-attention over the spatial+CLS sequence
-        attended = self.transformer(seq)             # (B, 1 + H*W, d_model)
+        # 3. Self-attention over the 25 spatial tokens + 1 CLS token.
+        #    Attention cost is 26² = 676 scores per sample (vs 401²
+        #    = 160k in the old stride-1 / 400-token variant).
+        attended = self.transformer(seq)             # (B, 26, d_model)
 
         # 4. Pool — use the CLS token as the context vector
         context = attended[:, 0, :]                  # (B, d_model)

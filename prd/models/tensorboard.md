@@ -39,14 +39,16 @@ Detail teknis `RolloutMetricsCallback`:
 
 ### Metrik training (per gradient step)
 
-| Signal                       | Algoritma | Tren sehat                                                               | Red flag                                                                 |
-| ---------------------------- | --------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
-| `train/learning_rate`        | PPO + DQN | Decay linear sesuai schedule (lihat `train.md § LR Schedule`)            | Stuck konstan tinggi di akhir → osilasi                                  |
-| `train/entropy_loss`         | PPO       | Turun perlahan, **tidak pernah collapse ke 0** (policy butuh eksplorasi) | Mendekati 0 terlalu cepat → eksploitasi prematur                         |
-| `train/policy_gradient_loss` | PPO       | Bounded, magnitude wajar                                                 | Tren ke ±∞ → gradien meledak                                             |
-| `train/approx_kl`            | PPO       | Rata-rata **< 0.05**, spike sesekali tidak masalah                       | Spike rutin > 0.1 → update terlalu besar, sering penyebab osilasi reward |
-| `train/loss`                 | DQN       | Cenderung turun perlahan dengan noise                                    | Naik tajam → divergensi Q-values                                         |
-| `train/q_value`              | DQN       | Sejalan dengan `rollout/ep_rew_mean`                                     | Terlalu tinggi/rendah → over-/under-estimation                           |
+| Signal                       | Algoritma | Tren sehat                                                               | Red flag                                                                                                                             |
+| ---------------------------- | --------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `train/learning_rate`        | PPO + DQN | Konstan sesuai config (lihat `train.md § LR Schedule`)                   | Stuck konstan tinggi di akhir → osilasi; decay agresif di awal → squeeze                                                             |
+| `train/entropy_loss`         | PPO       | Turun perlahan, **tidak pernah collapse ke 0** (policy butuh eksplorasi) | Mendekati 0 terlalu cepat → eksploitasi prematur                                                                                     |
+| `train/policy_gradient_loss` | PPO       | Bounded, magnitude wajar                                                 | Tren ke ±∞ → gradien meledak                                                                                                         |
+| `train/approx_kl`            | PPO       | Rata-rata **< 0.05**, spike sesekali tidak masalah                       | Spike rutin > 0.1 → update terlalu besar, sering penyebab osilasi reward                                                             |
+| `train/loss`                 | DQN       | Cenderung turun perlahan dengan noise                                    | Naik tajam → divergensi Q-values                                                                                                     |
+| `train/q_value`              | DQN       | Sejalan dengan `rollout/ep_rew_mean`                                     | Terlalu tinggi/rendah → over-/under-estimation                                                                                       |
+| `train/explained_variance`   | PPO       | Stabil di atas 0.4 sepanjang run                                         | **Drop terus (mis. 0.5 → 0.3)** → value function diverge; aktifkan `clip_range_vf` (lihat `train.md § Trust-Region pada Value Head`) |
+| `train/value_loss`           | PPO       | Stabil atau turun gradual                                                | **Naik konsisten** (mis. 14 → 17) → value head divergence; pertimbangkan naikkan `clip_range_vf` atau turunkan `learning_rate`       |
 
 ## Mengapa `ep_len_mean` lebih informatif daripada `ep_rew_mean`?
 
