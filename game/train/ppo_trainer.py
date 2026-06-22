@@ -91,26 +91,26 @@ class PPOTrainingConfig:
     # TrainingRenderCallback auto-disables at n_envs > 1 (the demo window
     # only makes sense with a single in-process env), which also restores
     # fps after switching from n_envs=1.
-    n_envs: int = 1
+    n_envs: int = 8
 
     # Schedule
     total_timesteps: int = 500_000
     # Optional user-facing episode target. When set, the progress bar
     # shows ``eps/total_episodes`` instead of just the running count.
     total_episodes: Optional[int] = None
-    learning_rate: float = 1e-3       # conservative default; 1e-3 1e-4 7e-4
+    learning_rate: float = 1e-4       # conservative default; 1e-3 1e-4 7e-4
     # With n_envs=4, n_steps=2048 → 8192 transitions/rollout, split into
     # 32 minibatches of 256 → 160 gradient steps per iter. Same update
     # budget as the old (n_envs=1, n_steps=4096, batch_size=128), but
     # with 4× more decorrelated experience feeding GAE.
     n_steps: int = 2048
     batch_size: int = 256
-    n_epochs: int = 9
+    n_epochs: int = 5
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    ent_coef: float = 0.018
-    vf_coef: float = 0.4
+    ent_coef: float = 0.05
+    vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
     # Learning-rate / clip-range schedule.

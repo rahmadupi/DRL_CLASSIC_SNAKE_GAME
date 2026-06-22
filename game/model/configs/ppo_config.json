@@ -3,18 +3,18 @@
 
   "obs_type": "spatiotemporal",
 
-  "n_envs": 1,
+  "n_envs": 16,
 
   "total_timesteps": 500000,
   "learning_rate": 1e-4,
 
   "n_steps": 2048,
   "batch_size": 256,
-  "n_epochs": 9,
+  "n_epochs": 4,
   "gamma": 0.99,
   "gae_lambda": 0.95,
   "clip_range": 0.2,
-  "ent_coef": 0.018,
+  "ent_coef": 0.05,
   "vf_coef": 0.4,
   "max_grad_norm": 0.5,
 
@@ -26,7 +26,7 @@
 
   "cnn_channels": 32,
   "d_model": 64,
-  "n_heads": 8,
+  "n_heads": 4,
   "dropout": 0.1,
   "use_attention": true,
 
