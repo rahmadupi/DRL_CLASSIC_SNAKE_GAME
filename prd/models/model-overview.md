@@ -2,12 +2,12 @@
 
 Proyek ini membandingkan arsitektur pada dua sumbu — **algoritma** (PPO vs DQN) dan **representasi state** (12-bit vector vs spatiotemporal tensor). Spatiotemporal saat ini menggunakan **4-channel honest layout** (Wall, Decaying body, Static food, Dynamic food momentum) — Ch4-Ch7 dari layout v2 lama (head dir, food dir, danger, broadcast snake length) sudah dihapus agar perbandingan mengukur algoritma, bukan _cheat-sheet_. Keempat kombinasinya diimplementasikan di `game/model/`:
 
-| File                               | Algo | Obs Type       | Extractor                                   | Head           |
-| ---------------------------------- | ---- | -------------- | ------------------------------------------- | -------------- |
+| File                               | Algo | Obs Type                 | Extractor                                   | Head           |
+| ---------------------------------- | ---- | ------------------------ | ------------------------------------------- | -------------- |
 | `game/model/ppo_spatiotemporal.py` | PPO  | spatiotemporal (4×20×20) | `SpatiotemporalExtractor` (CNN + Attention) | actor + critic |
-| `game/model/ppo_12bit.py`          | PPO  | 12bit (12,)    | `DQN12BitExtractor` (MLP 12→64→64→64)       | actor + critic |
+| `game/model/ppo_12bit.py`          | PPO  | 12bit (12,)              | `DQN12BitExtractor` (MLP 12→64→64→64)       | actor + critic |
 | `game/model/dqn_spatiotemporal.py` | DQN  | spatiotemporal (4×20×20) | `SpatiotemporalExtractor` (CNN + Attention) | Q-head         |
-| `game/model/dqn_12bit.py`          | DQN  | 12bit (12,)    | `DQN12BitExtractor` (MLP 12→64→64→64)       | Q-head         |
+| `game/model/dqn_12bit.py`          | DQN  | 12bit (12,)              | `DQN12BitExtractor` (MLP 12→64→64→64)       | Q-head         |
 
 Kedua `SpatiototemporalExtractor` (PPO & DQN) **identik secara byte-per-byte** karena di-import ulang oleh `dqn_spatiotemporal.py`. Begitu juga `DQN12BitExtractor` dipakai ulang oleh `ppo_12bit.py`. Pengulangan yang disengaja ini menjamin bahwa perbandingan algoritma tidak tercemar oleh perbedaan encoder — satu-satunya variabel antar algoritma adalah algoritmanya sendiri.
 

@@ -4,11 +4,11 @@ Lingkungan beroperasi menggunakan infrastruktur _Dual-Outlet State Space_ (ditam
 
 ## Ringkasan Outlet
 
-| `obs_type`                | Shape         | Digunakan oleh     | Status                    |
-| ------------------------- | ------------- | ------------------ | ------------------------- |
+| `obs_type`                | Shape         | Digunakan oleh     | Status                      |
+| ------------------------- | ------------- | ------------------ | --------------------------- |
 | `"spatiotemporal"`        | `(4, 20, 20)` | PPO (default), DQN | **Default — honest layout** |
-| `"spatiotemporal_legacy"` | `(4, 20, 20)` | PPO/DQN            | Alias (backward-compat)   |
-| `"12bit"`                 | `(12,)`       | DQN (default), PPO | Sesuai paper              |
+| `"spatiotemporal_legacy"` | `(4, 20, 20)` | PPO/DQN            | Alias (backward-compat)     |
+| `"12bit"`                 | `(12,)`       | DQN (default), PPO | Sesuai paper                |
 
 Pemilihan outlet sekarang bisa dilakukan dari TUI launcher lewat baris `[Obs Type]` (lihat `prd/models/train.md § Spesifikasi Antarmuka Curses`). Pada akhirnya, empat varian arsitektur × algoritma semuanya membaca dari outlet yang sama; hanya _features extractor_ di `game/model/` yang berbeda.
 
@@ -78,10 +78,10 @@ Lingkungan menerima parameter `level` untuk mengatur kompleksitas inisialisasi:
 
 1. **SB3 metadata** (`observation_space.shape`) — diparse dari field `data` JSON di dalam zip via `_read_sb3_metadata` di `game/env/input_controller.py`. Mapping shape → obs_type:
 
-   | Shape         | `obs_type`              |
-   | ------------- | ----------------------- |
-   | `(4, 20, 20)` | `spatiotemporal`        |
-   | `(12,)`       | `12bit`                 |
+   | Shape         | `obs_type`       |
+   | ------------- | ---------------- |
+   | `(4, 20, 20)` | `spatiotemporal` |
+   | `(12,)`       | `12bit`          |
 
    > Catatan: shape `(4, 20, 20)` sekarang cocok dengan **kedua** `spatiotemporal` dan `spatiotemporal_legacy` (kedua obs_type menghasilkan tensor identik). Regex nama file adalah fallback utama untuk membedakan keduanya; jika metadata SB3 tidak bisa di-decode, nama file menjadi penentu.
 
