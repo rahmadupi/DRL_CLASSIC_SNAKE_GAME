@@ -3,7 +3,7 @@ PPO Trainer
 ===========
 
 Builds a :class:`stable_baselines3.PPO` agent supporting BOTH the
-spatiotemporal (8×20×20) CNN+Transformer encoder AND the 12-bit
+spatiotemporal (4×20×20) CNN+Transformer encoder AND the 12-bit
 flat-vector baseline.
 
 Hyperparameter defaults live in
@@ -81,8 +81,8 @@ class PPOTrainingConfig:
     level: int = 1
     obs_type: str = "spatiotemporal"
     # Accepted values:
-    #   "spatiotemporal"        — 8×20×20 tensor       (CNN+Attention)
-    #   "spatiotemporal_legacy" — 4×20×20 tensor       (CNN+Attention)
+    #   "spatiotemporal"        — 4×20×20 tensor       (CNN+Attention, honest layout)
+    #   "spatiotemporal_legacy" — 4×20×20 tensor       (CNN+Attention, alias for backward-compat)
     #   "12bit"                 — flat 12-dim vector    (MLP)
 
     # Parallelism
@@ -214,9 +214,9 @@ def build_ppo(
     paying the cost of ``learn()``.
     """
     # Pick the right policy-kwargs factory based on the chosen obs_type.
-    # Spatiotemporal variants share the CNN+attention encoder
-    # (4- and 8-channel layouts both work — the extractor reads the
-    # channel count from the obs space shape). 12-bit uses an MLP.
+    # Spatiotemporal variants share the CNN+attention encoder; both
+    # produce the same 4-channel honest layout (the extractor reads
+    # the channel count from the obs space shape). 12-bit uses an MLP.
     if config.obs_type == "12bit":
         policy_kwargs = make_ppo_12bit_kwargs(
             hidden_dim=config.hidden_dim,

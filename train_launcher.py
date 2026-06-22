@@ -74,9 +74,9 @@ _OBS_TYPE_CYCLE = {
     "dqn": ["12bit", "spatiotemporal"],
 }
 _OBS_TYPE_PICKER_ITEMS = [
-    "spatiotemporal (8x20x20)",
+    "spatiotemporal (4x20x20, honest)",
     "12bit (12-dim vector)",
-    "spatiotemporal_legacy (4x20x20, compat)",
+    "spatiotemporal_legacy (4x20x20, alias)",
 ]   # labels are kept short to fit the centered 50-char modal
 
 

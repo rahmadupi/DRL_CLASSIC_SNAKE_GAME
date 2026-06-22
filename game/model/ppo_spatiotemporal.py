@@ -9,9 +9,8 @@ PPO via the `policy_kwargs={"features_extractor_class": ...}` hook.
 Pipeline
 --------
     Input tensor (B, C, 20, 20)  — C is read from ``observation_space.shape[0]``
-        │  C=4 (legacy) : (Wall | DecayingBody | StaticFood | DynamicMomentum)
-        │  C=8 (v2)     : 4 above + (HeadDir | FoodDir | RelativeDanger
-        │                 | SnakeLen)
+        │  C=4 (honest layout, current default) : Wall | DecayingBody
+        │                                          | StaticFood | DynamicMomentum
         ▼
     +-----------------------------+
     |  SPATIAL EXTRACTOR (CNN)    |  2 × Conv2d(ReLU) + Flatten
@@ -36,6 +35,23 @@ Pipeline
         │
         ├──► Actor head  → 4 action logits  (UP, RIGHT, DOWN, LEFT)
         └──► Critic head → 1 state value estimate
+
+What was removed from the v2 layout (and why)?
+----------------------------------------------
+The previous v2 layout exposed 8 channels: the four honest channels
+above plus head direction (Ch4), food direction (Ch5), relative danger
+(Ch6), and a broadcast snake length (Ch7). Those were heuristic
+crutches — they let the network read the answers instead of learning
+the underlying geometry from the raw channels:
+
+* Head direction    — deducible from Ch1's decay gradient.
+* Food direction    — deducible from Ch3's momentum + Ch2's static cells.
+* Relative danger   — deducible from Ch0 (walls) + Ch1 (body).
+* Snake length      — deducible from Ch1's body extent (or implicitly
+                       via the rollout signal).
+
+Removing them is what makes the PPO↔DQN and 12-bit↔spatiotemporal
+comparisons measure the algorithms, not the cheat-sheet.
 
 Why a Transformer over a flat MLP?
 ----------------------------------
@@ -64,8 +80,8 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
         observation_space: SB3 observation space (Box of shape (C, 20, 20)).
                            The number of input channels ``C`` is read from
                            ``observation_space.shape[0]`` and is forwarded
-                           to the first Conv2d — supports both the 4-channel
-                           v1 obs and the 8-channel v2 obs.
+                           to the first Conv2d — currently always 4 for
+                           the honest layout.
         cnn_channels:      Output channels of the two Conv2d layers.
         d_model:           Transformer embedding / hidden size.
         n_heads:           Number of attention heads.
@@ -85,7 +101,7 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
         dropout: float = 0.0,
         use_attention: bool = True,
     ):
-        # The grid is 20×20, C input channels (4 for v1 legacy, 8 for v2) →
+        # The grid is 20×20, C input channels (currently always 4) →
         # after two stride-1 convs the spatial size is preserved, so the
         # flattened length is cnn_channels*20*20 regardless of C.
         super().__init__(observation_space, features_dim=d_model)
@@ -94,10 +110,10 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
         self.grid_h: int = observation_space.shape[1]
         self.grid_w: int = observation_space.shape[2]
         # Read the input channel count from the obs space so the same
-        # extractor works for the 4-channel legacy obs AND the 10-channel
-        # v2 obs. SB3 only constructs the extractor once per env, so the
-        # mismatch failure mode for a wrong-shape model is caught at
-        # load time, not silently mid-training.
+        # extractor works for any C-channel honest layout (currently
+        # always 4). SB3 only constructs the extractor once per env,
+        # so the mismatch failure mode for a wrong-shape model is
+        # caught at load time, not silently mid-training.
         self.in_channels: int = int(observation_space.shape[0])
         self.cnn_channels: int = cnn_channels
         self.d_model: int = d_model
@@ -161,8 +177,9 @@ class SpatiotemporalExtractor(BaseFeaturesExtractor):
         """
         Args:
             observations: Tensor of shape (B, C, 20, 20), float32, where
-                          ``C`` matches the env's obs space (4 for legacy
-                          v1 obs, 8 for v2 obs).
+                          ``C`` matches the env's obs space (currently
+                          always 4 — Wall, Decaying body, Static food,
+                          Dynamic food momentum).
         Returns:
             Context vector of shape (B, features_dim).
         """

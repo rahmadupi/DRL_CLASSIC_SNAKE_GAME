@@ -43,52 +43,30 @@ DIRECTIONS = {
 # ---------------------------------------------------------------------------
 # Spatial observation channel layouts
 # ---------------------------------------------------------------------------
-# v1 (legacy): 4 channels — wall, decaying body, static food, dynamic food.
-# v2 (current): 8 channels — v1's 4 + head direction, food direction
-#                (1 ch, 4 cells), relative danger (1 ch, 3 cells),
-#                broadcast snake length. The dynamic-food per-cell map
-#                (Ch3, current=1.0, previous=0.5) is critical on levels
-#                3-4 where dynamic food is the ONLY target — without it
-#                the agent only has the directional signal in Ch5 and no
-#                position/long-range info to plan a path.
-SPATIAL_OBS_CHANNELS_V1 = 4
-SPATIAL_OBS_CHANNELS_V2 = 8
-
-# Channel indices for v2 (8-channel) obs. Centralised so the network and
-# any visualisations can refer to channels by name instead of magic ints.
-CH_DYNAMIC     = 3  # 1.0 at dynamic food's current cell, 0.5 at previous
-CH_HEAD_DIR    = 4  # 1.0 at the cell 1 step in current direction
-CH_FOOD_DIR    = 5  # 1.0 at the 4 cells around head in directions where
-                    #     ANY food exists; 0 otherwise (mirrors 12-bit Bits 8-11)
-CH_DANGER_REL  = 6  # 1.0 at the 3 cells STRAIGHT/LEFT/RIGHT of head
-                    #     (relative to current heading) if wall or body
-CH_LENGTH      = 7  # broadcast `len(snake) / 400` everywhere
-
-# ---------------------------------------------------------------------------
-# Per-channel enable / danger-source flags (all driven from config.json)
-# ---------------------------------------------------------------------------
-# ``OBS_ENABLE_*`` gates whether a channel is populated at all. When a flag
-# is False the corresponding channel is left at zero in the v2 obs, so the
-# effective channel count shrinks — the trainer/launcher must rebuild the
-# env so the observation_space (and the saved model's first conv) matches.
+# Honest obs (current default) — a single 4-channel 20×20 tensor:
+#   Ch0 Wall
+#   Ch1 Decaying body    — head=1.0, decays linearly to tail
+#   Ch2 Static food
+#   Ch3 Dynamic food     — 1.0 at current cell, 0.5 at previous cell
 #
-# ``DANGER_FROM_*`` splits the relative-danger channel by collision source.
-# The cell is marked dangerous if ANY enabled source considers it deadly.
-# Disable ``DANGER_FROM_BODY`` to make the snake ignore its own body in
-# this channel (the body is still there in Ch1, so it isn't truly invisible).
+# The previous v2 layout also exposed head direction, food direction,
+# relative danger, and snake length as separate channels on the grid.
+# Those were "heuristic crutches" — the network could simply read
+# them instead of learning the underlying geometry from Ch1's decay
+# gradient or the global dynamic-food motion in Ch3. Removing them is
+# what makes the comparison between PPO and DQN apples-to-apples on
+# the spatial representation. Snake length is no longer broadcast at
+# all — the agent must learn to deduce it from Ch1's body extent and
+# decay gradient (or learn it implicitly via the rollout signal).
 #
-# ``DANGER_TAIL_IS_SAFE`` = whether the deque tail is treated as a non-body
-# for danger marking. The tail vacates on the next step (snake never grows
-# AND moves in the same step), so it is technically safe — toggle to False
-# to make the agent treat the tail as a body cell.
-OBS_ENABLE_HEAD_DIRECTION = _cfg.OBS_ENABLE_HEAD_DIRECTION
-OBS_ENABLE_FOOD_DIRECTION = _cfg.OBS_ENABLE_FOOD_DIRECTION
-OBS_ENABLE_RELATIVE_DANGER = _cfg.OBS_ENABLE_RELATIVE_DANGER
-OBS_ENABLE_SNAKE_LENGTH = _cfg.OBS_ENABLE_SNAKE_LENGTH
-
-DANGER_FROM_WALL = _cfg.DANGER_FROM_WALL
-DANGER_FROM_BODY = _cfg.DANGER_FROM_BODY
-DANGER_TAIL_IS_SAFE = _cfg.DANGER_TAIL_IS_SAFE
+# ``CH_DYNAMIC`` is the only channel index that survives — it
+# identifies the dynamic-food momentum layer (1.0 current, 0.5
+# previous) inside the 4-channel grid, which is critical on levels 3-4
+# where dynamic food is the ONLY target. Without the
+# ``prev_position=0.5`` marker the agent only knows the food's current
+# cell but not where it is moving.
+SPATIAL_OBS_CHANNELS = 4
+CH_DYNAMIC = 3  # 1.0 at dynamic food's current cell, 0.5 at previous
 
 # Distance-shaping source / target-tracking flags (see game/env/config.json).
 #
@@ -124,36 +102,26 @@ REWARD_TIME = _cfg.REWARD_TIME
 REWARD_MOD = list(_cfg.REWARD_MOD)
 REWARD_MOD_CAP = list(_cfg.REWARD_MOD_CAP)
 
-# Milestone bonus — modest linear growth applied ONLY when the snake
-# crosses a length multiple of REWARD_MILESTONE_INTERVAL. Per-milestone
-# bonus = REWARD_MILESTONE_MOD * (1 + REWARD_MILESTONE_GROWTH * index),
-# so with default MOD=20 and GROWTH=0.1:
-#   milestone 1 (length  5) → +22
-#   milestone 2 (length 10) → +24
-#   milestone 5 (length 25) → +30
-#   milestone 10 (length 50) → +40
-# Pushes the agent past the orbit/satisfice attractor with a tame ramp.
-# All values driven from config.json.
-REWARD_MILESTONE_ENABLED = _cfg.REWARD_MILESTONE_ENABLED
-REWARD_MILESTONE_INTERVAL = _cfg.REWARD_MILESTONE_INTERVAL
-REWARD_MILESTONE_MOD = _cfg.REWARD_MILESTONE_MOD
-REWARD_MILESTONE_GROWTH = _cfg.REWARD_MILESTONE_GROWTH
-
-# Stagnation penalty — charges the agent for steps that don't reduce
-# its distance to the nearest food. Targets the orbit attractor
-# (circling keeps distance ~constant) without changing terminal rewards.
-STAGNATION_ENABLED = _cfg.STAGNATION_ENABLED
-STAGNATION_THRESHOLD = _cfg.STAGNATION_THRESHOLD
-STAGNATION_PENALTY = _cfg.STAGNATION_PENALTY
-
+# Note: the previous MILESTONE-bonus and STAGNATION-penalty features
+# were removed. Milestone bonuses caused instability in the late-game
+# reward signal (sawtooth spikes on every length threshold). Stagnation
+# was redundant with the constant REWARD_TIME pressure and added noise
+# to the approach/away distance metric. The reward surface is now:
+#   * distance shaping (approach / away)
+#   * food (static / dynamic)
+#   * collision
+#   * constant time penalty
+#   * encircle penalty (see below — kept; it catches a failure mode
+#     that the distance shaping alone does NOT catch)
+#
 # Encircle penalty — per-step cost while the snake's head is inside a
 # closed loop formed by its own body (i.e. unreachable from any
 # non-snake boundary cell without crossing the body). Targets the
-# "approach food but trap self" failure mode that the stagnation
-# penalty alone does NOT catch (distance can still be decreasing while
-# the snake closes the loop around itself). Detection is BFS flood-
-# fill from the first unoccupied corner; O(grid_size²) per step.
-# Orthogonal to stagnation — both can fire simultaneously (rare).
+# "approach food but trap self" failure mode: the snake may still be
+# reducing distance to food while its body is curving into an
+# inescapable ring, so plain distance shaping does not catch it.
+# Detection is BFS flood-fill from the first unoccupied corner;
+# O(grid_size²) per step.
 ENCIRCLE_PENALTY_ENABLED = _cfg.ENCIRCLE_PENALTY_ENABLED
 ENCIRCLE_PENALTY = _cfg.ENCIRCLE_PENALTY
 ENCIRCLE_DETECTION_MODE = _cfg.ENCIRCLE_DETECTION_MODE
@@ -269,30 +237,28 @@ class dynamic_food:
 
 class game_environment(gym.Env):
     """
-    Snake environment with dual-outlet observations.
+    Snake environment with multi-outlet observations.
 
     Observation types:
-        - "spatiotemporal"        : 8×20×20 tensor (v2 — current default)
+        - "spatiotemporal"        : 4×20×20 tensor — HONEST layout (default)
             Ch0 Wall             — 1.0 on the four border rows/cols
             Ch1 Decaying body    — head=1.0, decays linearly to tail
+                                   (also implicitly encodes length via
+                                   the extent of the decay)
             Ch2 Static food      — 1.0 at each static food cell
-            Ch3 Dynamic food     — 1.0 at current cell, 0.5 at previous cell
+            Ch3 Dynamic food     — 1.0 at current cell, 0.5 at previous
                                    (per-cell map; critical on levels 3-4)
-            Ch4 Head direction   — 1.0 at the cell 1 step in `direction_idx`
-            Ch5 Food direction   — 1.0 at the 4 cells around the head in any
-                                   direction where SOME food exists; mirrors
-                                   the 12-bit obs's Bits 8-11 (dx, dy signs)
-            Ch6 Relative danger  — 1.0 at the 3 cells STRAIGHT/LEFT/RIGHT
-                                   of head (relative to current heading) if
-                                   wall or body; "behind" is always safe
-                                   (no 180° reversal), so omitted. Sources
-                                   are split by config: DANGER_FROM_WALL,
-                                   DANGER_FROM_BODY, DANGER_TAIL_IS_SAFE
-                                   (see game/env/config.json).
-            Ch7 Snake length     — broadcast `len(snake) / 400` on every cell
-        - "spatiotemporal_legacy" : 4×20×20 tensor (v1 — backward-compat for
-            any saved model trained on the 4-channel layout with dynamic
-            food map)
+            The previous v2 layout also exposed head direction, food
+            direction, relative danger, and snake length as separate
+            channels on the grid. Those were heuristic crutches — they
+            let the network read the answers instead of learning the
+            geometry from Ch1 (decay gradient → heading, extent →
+            length) and Ch3 (momentum → food trajectory). Removed so
+            PPO↔DQN and 12-bit↔spatiotemporal comparisons measure the
+            algorithms, not the cheat-sheet.
+        - "spatiotemporal_legacy" : 4×20×20 tensor — identical layout to
+            ``spatiotemporal``. Kept purely so old saved-model filenames
+            still resolve correctly via the obs_type-detection regex.
         - "12bit"                 : 1D 12-bit vector (obstacles + food dir)
     """
 
@@ -321,10 +287,6 @@ class game_environment(gym.Env):
         assert obs_type in (
             "spatiotemporal", "spatiotemporal_legacy", "12bit",
         ), f"Invalid obs_type: {obs_type!r}"
-        if REWARD_MILESTONE_ENABLED:
-            assert REWARD_MILESTONE_INTERVAL > 0, (
-                f"REWARD_MILESTONE_INTERVAL must be > 0, got {REWARD_MILESTONE_INTERVAL}"
-            )
 
         self.level = level
         self.obs_type = obs_type
@@ -334,23 +296,15 @@ class game_environment(gym.Env):
         # Action space: 4 discrete directions
         self.action_space = spaces.Discrete(4)
 
-        # Observation space
-        if obs_type == "spatiotemporal":
-            self.observation_space = spaces.Box(
-                low=0.0, high=1.0,
-                shape=(SPATIAL_OBS_CHANNELS_V2, GRID_SIZE, GRID_SIZE),
-                dtype=np.float32,
-            )
-        elif obs_type == "spatiotemporal_legacy":
-            self.observation_space = spaces.Box(
-                low=0.0, high=1.0,
-                shape=(SPATIAL_OBS_CHANNELS_V1, GRID_SIZE, GRID_SIZE),
-                dtype=np.float32,
-            )
-        else:  # 12bit
-            self.observation_space = spaces.Box(
-                low=0.0, high=1.0, shape=(12,), dtype=np.float32,
-            )
+        # Observation space — honest 4-channel spatial grid (no scalar
+        # side-channel, no heuristic crutches). See the class docstring
+        # for why Ch4-Ch7 (head dir, food dir, danger, length) were
+        # removed from the spatial tensor.
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0,
+            shape=(SPATIAL_OBS_CHANNELS, GRID_SIZE, GRID_SIZE),
+            dtype=np.float32,
+        )
 
         # State (initialized on reset)
         self.snake: deque = deque()
@@ -359,17 +313,6 @@ class game_environment(gym.Env):
         self.dynamic_food: List[dynamic_food] = []
         self.steps_taken: int = 0
         self.step_counter_for_dynamic: int = 0  # 2 out of 3 ticks for dynamic movement
-
-        # Stagnation tracking — number of consecutive steps without
-        # reducing the head's distance to the nearest food. Reset to 0
-        # in reset() and on any approach step (see step()).
-        self._no_progress_steps: int = 0
-        self._stagnation_threshold: int = STAGNATION_THRESHOLD
-        self._stagnation_penalty: float = STAGNATION_PENALTY
-
-        # Milestone tracking — last length multiple of MILESTONE_INTERVAL
-        # credited in this episode. Reset to initial value in reset().
-        self._last_milestone: int = 0
 
         # Target-food tracking — the food cell the env has committed to
         # for approach reward (see TARGET_FOOD_ENABLED). None means "no
@@ -416,8 +359,6 @@ class game_environment(gym.Env):
         self._init_food()
         self.steps_taken = 0
         self.step_counter_for_dynamic = 0
-        self._no_progress_steps = 0
-        self._last_milestone = INITIAL_SNAKE_LENGTH // REWARD_MILESTONE_INTERVAL
         # Drop any commitment to a target food from the previous episode.
         # The new episode starts uncommitted; the first step() will pick
         # the nearest static food.
@@ -500,36 +441,6 @@ class game_environment(gym.Env):
                 "snake_length": len(self.snake),
                 "approach_ratio": self._approach_ratio,
             }
-
-        # Stagnation tracking — use the same distance metric as the
-        # shaping reward so the two signals agree on what "progress"
-        # means. Reset the counter on any approach step; otherwise
-        # increment. Counter is consumed by _compute_reward below and
-        # also drives the commitment-timeout (see below).
-        # When target tracking is enabled this naturally tracks progress
-        # toward the committed target (not whichever food happens to
-        # be closest this step).
-        old_dist_stag = self._food_distance(old_head)
-        new_dist_stag = self._food_distance(new_head)
-        if new_dist_stag < old_dist_stag:
-            self._no_progress_steps = 0
-        else:
-            self._no_progress_steps += 1
-
-        # Commitment timeout — if the snake has been making no progress
-        # toward its target for TARGET_SWITCH_AFTER_AWAY_STEPS
-        # consecutive steps, the body has likely encircled the target
-        # and the commitment is a trap. Drop it and let the next step
-        # commit to a new food (the nearest static food in the open).
-        if (
-            TARGET_FOOD_ENABLED
-            and self._target_food is not None
-            and self._no_progress_steps >= TARGET_SWITCH_AFTER_AWAY_STEPS
-        ):
-            self._target_food = None
-            # Reset the counter so the new commitment gets a fresh
-            # grace period before the next timeout check fires.
-            self._no_progress_steps = 0
 
         # Compute reward (uses _food_distance, which is target-aware
         # — _ensure_target_food was already called above so the target
@@ -738,8 +649,8 @@ class game_environment(gym.Env):
 
         When target tracking is on AND a target is set, this is the
         distance to that specific cell. Otherwise it falls back to
-        :func:`_nearest_food_distance` so callers (reward shaping,
-        stagnation penalty) get a consistent "progress metric".
+        :func:`_nearest_food_distance` so callers (approach/away
+        reward shaping) get a consistent "progress metric".
         """
         if TARGET_FOOD_ENABLED and self._target_food is not None:
             return math.hypot(
@@ -845,13 +756,24 @@ class game_environment(gym.Env):
         new_head: Tuple[int, int],
         food_type: Optional[str],
     ) -> float:
-        """Distance-based shaping + food/collision/time rewards."""
+        """Distance-based shaping + food/collision/time rewards.
+
+        Reward surface (in evaluation order):
+            1. Distance shaping (approach / away)
+            2. Food eaten (static / dynamic)
+            3. Constant time penalty
+            4. Encircle penalty (BFS-detected self-trap)
+
+        The previous milestone-bonus and stagnation-penalty terms
+        were removed — see the comment block above the
+        ``REWARD_MOD`` constants for the rationale.
+        """
         reward = 0.0
 
         # 1. Distance-based shaping — tracks the COMMITTED target food
         # when target tracking is enabled, otherwise the nearest food
-        # right now. Both branches share _food_distance so the shaping
-        # signal here matches the stagnation counter above.
+        # right now. Both branches share _food_distance so the
+        # approach/away signal is consistent.
         old_dist = self._food_distance(old_head)
         new_dist = self._food_distance(new_head)
         if new_dist < old_dist:
@@ -870,53 +792,20 @@ class game_environment(gym.Env):
         elif food_type == "dynamic":
             reward += REWARD_EAT_DYNAMIC
 
-        # 3. Milestone bonus — ONLY for crossing length thresholds.
-        # Per-milestone bonus = REWARD_MILESTONE_MOD *
-        #   (1 + REWARD_MILESTONE_GROWTH * milestone_index)
-        # The bonus applies solely when the snake crosses a length
-        # multiple of REWARD_MILESTONE_INTERVAL; no other reward term
-        # is scaled by it. Multi-step safe via arithmetic-series sum:
-        # sum(i for i in prev+1..current).
-        if REWARD_MILESTONE_ENABLED:
-            current_milestone = len(self.snake) // REWARD_MILESTONE_INTERVAL
-            if current_milestone > self._last_milestone:
-                prev = self._last_milestone
-                steps = current_milestone - prev
-                index_sum = (
-                    current_milestone * (current_milestone + 1) // 2
-                    - prev * (prev + 1) // 2
-                )
-                reward += REWARD_MILESTONE_MOD * (
-                    steps + REWARD_MILESTONE_GROWTH * index_sum
-                )
-                self._last_milestone = current_milestone
-
-        # 4. Time penalty
+        # 3. Time penalty
         reward += REWARD_TIME
 
-        # 5. Stagnation penalty — per-step cost after the head has gone
-        # ``STAGNATION_THRESHOLD`` consecutive steps without reducing
-        # its distance to the nearest food. Per-step (not one-shot)
-        # so the policy gradient is smooth across the threshold. Gated
-        # by STAGNATION_ENABLED so the env still runs cleanly when
-        # the feature is disabled via config.
-        if (
-            STAGNATION_ENABLED
-            and self._no_progress_steps >= self._stagnation_threshold
-        ):
-            reward += self._stagnation_penalty
-
-        # 6. Encircle penalty — per-step cost while the snake's head is
+        # 4. Encircle penalty — per-step cost while the snake's head is
         # inside a closed loop of its own body (BFS from outside cannot
         # reach the head without crossing the snake). Targets the
         # "approach food but trap self" failure mode: the snake may
         # still be reducing distance to food while its body is curving
-        # into an inescapable ring, so the stagnation penalty above
-        # does not catch it. Per-step so the agent learns "don't
-        # close the loop" well before the inevitable collision.
-        # Gated by ENCIRCLE_PENALTY_ENABLED and the detection mode
-        # (currently only "flood_fill" — other modes can be added
-        # later as cheaper approximations).
+        # into an inescapable ring, so plain distance shaping does
+        # not catch it. Per-step so the agent learns "don't close the
+        # loop" well before the inevitable collision. Gated by
+        # ENCIRCLE_PENALTY_ENABLED and the detection mode (currently
+        # only "flood_fill" — other modes can be added later as
+        # cheaper approximations).
         if (
             ENCIRCLE_PENALTY_ENABLED
             and ENCIRCLE_DETECTION_MODE == "flood_fill"
@@ -939,43 +828,45 @@ class game_environment(gym.Env):
     # ----------------------------------------------------------------
     # Spatial obs builders
     # ----------------------------------------------------------------
-    def _spatiotemporal_legacy_obs(self) -> np.ndarray:
-        """4×20×20 v1 tensor (kept for backward compat with old models).
+    def _spatiotemporal_obs(self) -> np.ndarray:
+        """4×20×20 tensor — honest layout (current default).
 
             Ch0 Wall
             Ch1 Decaying body (head=1.0, tail→0.0)
             Ch2 Static food
-            Ch3 Dynamic momentum (t=1.0, t-1=0.5)
+            Ch3 Dynamic food (current=1.0, previous=0.5)
         """
-        return self._build_spatial_obs_v1()
+        return self._build_spatial_obs()
 
-    def _spatiotemporal_obs(self) -> np.ndarray:
-        """8×20×20 v2 tensor — the default spatial obs.
+    def _spatiotemporal_legacy_obs(self) -> np.ndarray:
+        """Alias for :meth:`_spatiotemporal_obs`.
 
-            Ch0 Wall               (binary)
-            Ch1 Decaying body      (head=1.0, tail→0.0)
-            Ch2 Static food        (1.0 at each static food cell)
-            Ch3 Dynamic food       (1.0 at current cell, 0.5 at previous cell)
-            Ch4 Head direction     (1.0 at the cell 1 step in `direction_idx`)
-            Ch5 Food direction     (1.0 at the 4 cells around the head in
-                                    any direction where food exists; mirrors
-                                    12-bit obs Bits 8-11)
-            Ch6 Relative danger    (1.0 at the 3 cells STRAIGHT/LEFT/RIGHT
-                                    of head, if wall or body)
-            Ch7 Snake length       (broadcast `len(snake) / 400` everywhere)
+        The legacy obs_type exists purely for backward-compat with
+        saved-model filenames — both ``spatiotemporal`` and
+        ``spatiotemporal_legacy`` now produce the exact same 4-channel
+        tensor since Ch4-Ch7 were removed (see class docstring).
         """
-        return self._build_spatial_obs_v2()
+        return self._build_spatial_obs()
 
-    def _build_spatial_obs_v1(self) -> np.ndarray:
-        """Legacy 4-channel obs kept for backward compat with old models.
+    def _build_spatial_obs(self) -> np.ndarray:
+        """Build the 4-channel spatial grid.
 
-        v1 layout: Ch0 Wall, Ch1 Decaying body, Ch2 Static food, Ch3
-        Dynamic food (current=1.0, previous=0.5). New models should
-        use the v2 7-channel obs via ``obs_type="spatiotemporal"`` —
-        v1 exists only so saved models with the 4-channel shape still
-        load via ``obs_type="spatiotemporal_legacy"``.
+        Layout: Ch0 Wall, Ch1 Decaying body, Ch2 Static food, Ch3
+        Dynamic food (current=1.0, previous=0.5). This is the only
+        spatial obs produced by the env — both ``spatiotemporal`` and
+        ``spatiotemporal_legacy`` ``obs_type`` values return this
+        tensor.
+
+        Notes on what is NOT here (removed from the previous v2 layout):
+        * Head direction     — deducible from Ch1's decay gradient.
+        * Food direction     — deducible from Ch3's momentum + Ch2.
+        * Relative danger    — deducible from Ch0 (walls) + Ch1 (body).
+        * Snake length       — no longer broadcast; the agent must
+                                 learn it from Ch1's body extent and
+                                 decay gradient (or implicitly via the
+                                 rollout signal).
         """
-        obs = np.zeros((4, GRID_SIZE, GRID_SIZE), dtype=np.float32)
+        obs = np.zeros((SPATIAL_OBS_CHANNELS, GRID_SIZE, GRID_SIZE), dtype=np.float32)
 
         # Channel 0: Walls
         obs[0, 0, :] = 1.0
@@ -1003,128 +894,6 @@ class game_environment(gym.Env):
             pr, pc = dfood.prev_position
             if 0 <= pr < GRID_SIZE and 0 <= pc < GRID_SIZE:
                 obs[3, pr, pc] = max(obs[3, pr, pc], 0.5)
-
-        return obs
-
-    def _build_spatial_obs_v2(self) -> np.ndarray:
-        """Full 8-channel v2 obs (current default).
-
-        Layout: Ch0 Wall, Ch1 Decaying body, Ch2 Static food,
-                Ch3 Dynamic food (current=1.0, previous=0.5),
-                Ch4 Head direction, Ch5 Food direction (4 cells),
-                Ch6 Relative danger (3 cells STRAIGHT/LEFT/RIGHT of
-                head), Ch7 Snake length.
-
-        Ch0-Ch3 are reused from the v1 obs (which has the same first
-        four channels) so the per-cell dynamic-food map is built only
-        once. Ch4-Ch7 add the directional / danger / length signals
-        on top.
-        """
-        obs = np.zeros(
-            (SPATIAL_OBS_CHANNELS_V2, GRID_SIZE, GRID_SIZE), dtype=np.float32,
-        )
-        # Ch0-Ch3: Wall, body, static food, dynamic food (reused from v1).
-        # The v1 obs already writes these four channels in the right
-        # layout — re-running it here is cheaper than duplicating the
-        # body / food loops and keeps the dynamic-food momentum marker
-        # (1.0 current, 0.5 previous) consistent across both obs types.
-        obs[:4] = self._build_spatial_obs_v1()
-
-        head_r, head_c = self.snake[0]
-        dr, dc = DIRECTIONS[self.direction_idx]
-
-        # ----------------------------------------------------------------
-        # Ch4: Head direction — mark the cell the head will move into.
-        # ----------------------------------------------------------------
-        next_r, next_c = head_r + dr, head_c + dc
-        if 0 <= next_r < GRID_SIZE and 0 <= next_c < GRID_SIZE:
-            obs[CH_HEAD_DIR, next_r, next_c] = 1.0
-
-        # ----------------------------------------------------------------
-        # Ch5: Food in each direction (1 channel, up to 4 cells).
-        # 1.0 at the cell adjacent to the head in any of the 4 absolute
-        # directions (UP/RIGHT/DOWN/LEFT) where SOME food exists
-        # anywhere in that half-plane relative to the head. This mirrors
-        # the 12-bit obs's Bits 8-11 (sign of dy, sign of dx), so a
-        # PPO→DQN ablation can read the same scalar signal from either
-        # obs type.
-        # ----------------------------------------------------------------
-        all_food = list(self.static_food) + [d.position for d in self.dynamic_food]
-        for action, (fdr, fdc) in DIRECTIONS.items():
-            # Same sign test as 12-bit obs's Bits 8-11: a direction is
-            # "set" if ANY food cell has the matching sign of
-            # (food - head) along that axis. Strict inequality (>, <)
-            # matches the 12-bit obs exactly — food directly on the same
-            # row/col as the head is still "in that direction" for the
-            # 12-bit version, so we mirror that semantics.
-            if fdr != 0:  # vertical: fdr ∈ {-1, +1}
-                sign = 1 if fdr > 0 else -1
-                if any(((fr - head_r) * sign) > 0 for fr, _ in all_food):
-                    tr, tc = head_r + fdr, head_c
-                    if 0 <= tr < GRID_SIZE and 0 <= tc < GRID_SIZE:
-                        obs[CH_FOOD_DIR, tr, tc] = 1.0
-            else:  # horizontal: fdc ∈ {-1, +1}
-                sign = 1 if fdc > 0 else -1
-                if any(((fc - head_c) * sign) > 0 for _, fc in all_food):
-                    tr, tc = head_r, head_c + fdc
-                    if 0 <= tr < GRID_SIZE and 0 <= tc < GRID_SIZE:
-                        obs[CH_FOOD_DIR, tr, tc] = 1.0
-
-        # ----------------------------------------------------------------
-        # Ch6: Relative danger (1 channel, up to 3 cells). Mark the 3
-        # cells STRAIGHT/LEFT/RIGHT of the head — relative to the head's
-        # CURRENT HEADING. The "behind" cell is omitted because
-        # `_apply_action` enforces no 180° reversal, so the snake can
-        # never move into that cell on the next step. A cell is 1.0
-        # if any of the configured ``DANGER_FROM_*`` sources consider
-        # it deadly; otherwise 0. Sources are split by config flag so
-        # the user can train with body-only or wall-only danger without
-        # touching code (see game/env/config.json).
-        # ----------------------------------------------------------------
-        # Rotate (dr, dc) by 90° CCW → (-dc, dr) → snake's LEFT side.
-        # Rotate (dr, dc) by 90° CW  → (dc, -dr) → snake's RIGHT side.
-        straight = (head_r + dr,     head_c + dc)
-        left     = (head_r - dc,     head_c + dr)
-        right    = (head_r + dc,     head_c - dr)
-        snake_set = set(self.snake)
-        tail = self.snake[-1]
-        for nr, nc in (straight, left, right):
-            in_grid = (0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE)
-            if not in_grid:
-                # Out of grid (e.g., head at row 1 facing UP → STRAIGHT
-                # cell is row 0 which is the wall). Mark the head cell
-                # itself as a sentinel — there's no in-grid cell at
-                # the relative position. The network learns "Ch6 at my
-                # own position = wall in some relative direction".
-                # Only emit this sentinel when the wall source is enabled,
-                # so a wall-ignorant agent doesn't see a phantom signal.
-                if DANGER_FROM_WALL:
-                    obs[CH_DANGER_REL, head_r, head_c] = 1.0
-                continue
-            # In-grid. The cell is dangerous per source:
-            #   * DANGER_FROM_WALL : row 0/19 or col 0/19 (the border)
-            #   * DANGER_FROM_BODY : a body cell, optionally treating
-            #                         the tail as safe (it vacates next
-            #                         step, so is not a real obstacle)
-            # DANGER_TAIL_IS_SAFE toggles the tail exception; the body
-            # source is considered off entirely when DANGER_FROM_BODY=False.
-            is_wall = DANGER_FROM_WALL and (
-                nr == 0 or nr == GRID_SIZE - 1
-                or nc == 0 or nc == GRID_SIZE - 1
-            )
-            is_tail_cell = DANGER_TAIL_IS_SAFE and (nr, nc) == tail
-            is_body = DANGER_FROM_BODY and (
-                (nr, nc) in snake_set and not is_tail_cell
-            )
-            if is_wall or is_body:
-                obs[CH_DANGER_REL, nr, nc] = 1.0
-
-        # ----------------------------------------------------------------
-        # Ch7: Snake length broadcast — single global scalar the CNN
-        # can read off any cell. Normalised to MAX_GRID_AREA so it
-        # stays in [0, 1] and matches the Box space high bound.
-        # ----------------------------------------------------------------
-        obs[CH_LENGTH, :, :] = min(1.0, len(self.snake) / float(MAX_GRID_AREA))
 
         return obs
 

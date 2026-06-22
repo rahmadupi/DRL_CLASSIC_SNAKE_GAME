@@ -3,7 +3,7 @@ DQN Trainer
 ===========
 
 DQN agent supporting BOTH the 12-bit flat-vector baseline AND the
-spatiotemporal (8×20×20) CNN+Transformer encoder. Mirrors
+spatiotemporal (4×20×20) CNN+Transformer encoder. Mirrors
 :mod:`game.train.ppo_trainer` so the PPO vs DQN comparison is
 apples-to-apples — same env, same curriculum, same logger cadence.
 
@@ -12,8 +12,8 @@ Notable differences from the PPO trainer:
 * ``obs_type`` is selectable via :class:`DQNTrainingConfig`:
     - ``"12bit"`` — the flat 12-dim vector, used with the MLP
       :class:`game.model.dqn_12bit.DQN12BitExtractor`.
-    - ``"spatiotemporal"`` / ``"spatiotemporal_legacy"`` — the 8- or
-      4-channel 20×20 tensor, used with the CNN+attention
+    - ``"spatiotemporal"`` / ``"spatiotemporal_legacy"`` — the
+      4-channel 20×20 honest tensor, used with the CNN+attention
       :class:`game.model.ppo_spatiotemporal.SpatiotemporalExtractor`
       (the same encoder used by PPO so the spatial feature learning
       is directly comparable).
@@ -77,8 +77,8 @@ class DQNTrainingConfig:
     obs_type: str = "12bit"
     # Accepted values:
     #   "12bit"                 — flat 12-dim vector  (MLP encoder)
-    #   "spatiotemporal"        — 8×20×20 tensor       (CNN+Attention)
-    #   "spatiotemporal_legacy" — 4×20×20 tensor       (CNN+Attention)
+    #   "spatiotemporal"        — 4×20×20 tensor       (CNN+Attention, honest layout)
+    #   "spatiotemporal_legacy" — 4×20×20 tensor       (CNN+Attention, alias for backward-compat)
 
     # Parallelism
     # DQN is off-policy (replay buffer), so multi-env helps wall-clock
@@ -192,7 +192,7 @@ def build_dqn(
     # Pick the right policy-kwargs factory based on the chosen obs_type.
     # The 12-bit path uses an MLP; both spatiotemporal variants reuse
     # the CNN+attention encoder (which auto-detects the channel count
-    # from the obs space shape, so 4- and 8-channel layouts both work).
+    # from the obs space shape, so 4-channel honest layouts work).
     if config.obs_type == "12bit":
         policy_kwargs = make_dqn_12bit_kwargs(
             hidden_dim=config.hidden_dim,

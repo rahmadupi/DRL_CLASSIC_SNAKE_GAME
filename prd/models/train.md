@@ -203,7 +203,7 @@ Empat direktori di atas adalah run terpisah di TensorBoard — bisa dibandingkan
 
 - **New run**: instantiate `PPO(...)` atau `DQN(...)` dengan policy kwargs kustom:
   - `obs_type == "12bit"` → `make_ppo_policy_kwargs(...)` / `make_dqn_policy_kwargs(...)` dengan MLP features extractor (3-layer Dense).
-  - `obs_type ∈ {"spatiotemporal", "spatiotemporal_legacy"}` → factory CNN+Attention yang membaca channel count dari `observation_space.shape[0]` (auto-handles 4- dan 8-channel).
+  - `obs_type ∈ {"spatiotemporal", "spatiotemporal_legacy"}` → factory CNN+Attention yang membaca channel count dari `observation_space.shape[0]` (saat ini selalu 4-channel honest layout).
 - **Resume**: panggil `PPO.load()` / `DQN.load()` dengan `custom_objects={"learning_rate": ...}` agar schedule LR dapat di-override per-stage curriculum. Setelah `load()`, kedua trainer men-override `model.lr_schedule` (PPO juga `model.clip_range`) lewat helper bersama `build_lr_schedule(...)` di `game/train/utility.py`. Lihat §LR Schedule di bawah untuk motivasi linear decay.
 
 ### LR & Clip-Range Schedule (Linear Decay)
@@ -323,7 +323,7 @@ Disarankan sebagai _default_ untuk run PPO/DQN Level 1 di mana agen mulai dari b
 | Aspek                     | PPO                                            | DQN                                            |
 | ------------------------- | ---------------------------------------------- | ---------------------------------------------- |
 | VecEnv                    | `SubprocVecEnv` (jika `n_envs>1`)              | `DummyVecEnv` (default) atau capped multi-env  |
-| Obs type (default)        | `spatiotemporal` (8×20×20 tensor)              | `12bit` (flat 12-dim vector)                   |
+| Obs type (default)        | `spatiotemporal` (4×20×20 honest tensor)       | `12bit` (flat 12-dim vector)                   |
 | Obs type (alternatif)     | `12bit` atau `spatiotemporal_legacy`           | `spatiotemporal` atau `spatiotemporal_legacy`  |
 | Checkpoint `save_freq`    | dibagi `n_envs`                                | absolute                                       |
 | Replay buffer             | ❌ tidak di-save                               | ✅ di-save untuk resume                        |

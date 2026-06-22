@@ -1,13 +1,13 @@
 # ARCHITECTURE & EXPERIMENT DESIGN
 
-Proyek ini membandingkan arsitektur pada dua sumbu — **algoritma** (PPO vs DQN) dan **representasi state** (12-bit vector vs spatiotemporal tensor). Keempat kombinasinya diimplementasikan di `game/model/`:
+Proyek ini membandingkan arsitektur pada dua sumbu — **algoritma** (PPO vs DQN) dan **representasi state** (12-bit vector vs spatiotemporal tensor). Spatiotemporal saat ini menggunakan **4-channel honest layout** (Wall, Decaying body, Static food, Dynamic food momentum) — Ch4-Ch7 dari layout v2 lama (head dir, food dir, danger, broadcast snake length) sudah dihapus agar perbandingan mengukur algoritma, bukan _cheat-sheet_. Keempat kombinasinya diimplementasikan di `game/model/`:
 
 | File                               | Algo | Obs Type       | Extractor                                   | Head           |
 | ---------------------------------- | ---- | -------------- | ------------------------------------------- | -------------- |
-| `game/model/ppo_spatiotemporal.py` | PPO  | spatiotemporal | `SpatiotemporalExtractor` (CNN + Attention) | actor + critic |
-| `game/model/ppo_12bit.py`          | PPO  | 12bit          | `DQN12BitExtractor` (MLP 12→64→64→64)       | actor + critic |
-| `game/model/dqn_spatiotemporal.py` | DQN  | spatiotemporal | `SpatiotemporalExtractor` (CNN + Attention) | Q-head         |
-| `game/model/dqn_12bit.py`          | DQN  | 12bit          | `DQN12BitExtractor` (MLP 12→64→64→64)       | Q-head         |
+| `game/model/ppo_spatiotemporal.py` | PPO  | spatiotemporal (4×20×20) | `SpatiotemporalExtractor` (CNN + Attention) | actor + critic |
+| `game/model/ppo_12bit.py`          | PPO  | 12bit (12,)    | `DQN12BitExtractor` (MLP 12→64→64→64)       | actor + critic |
+| `game/model/dqn_spatiotemporal.py` | DQN  | spatiotemporal (4×20×20) | `SpatiotemporalExtractor` (CNN + Attention) | Q-head         |
+| `game/model/dqn_12bit.py`          | DQN  | 12bit (12,)    | `DQN12BitExtractor` (MLP 12→64→64→64)       | Q-head         |
 
 Kedua `SpatiototemporalExtractor` (PPO & DQN) **identik secara byte-per-byte** karena di-import ulang oleh `dqn_spatiotemporal.py`. Begitu juga `DQN12BitExtractor` dipakai ulang oleh `ppo_12bit.py`. Pengulangan yang disengaja ini menjamin bahwa perbandingan algoritma tidak tercemar oleh perbedaan encoder — satu-satunya variabel antar algoritma adalah algoritmanya sendiri.
 
@@ -15,7 +15,7 @@ Kedua `SpatiototemporalExtractor` (PPO & DQN) **identik secara byte-per-byte** k
 
 Algoritma PPO (_On-Policy_) dipilih untuk menghindari _memory leak_ dari _Replay Buffer_ DQN saat memproses tensor matriks masif.
 
-- **Spatial Extractor:** 2 layer Conv2D + ReLU. Mengekstrak relasi geometrik lokal dari tensor 20×20×8 (atau 20×20×4 untuk v1 legacy).
+- **Spatial Extractor:** 2 layer Conv2D + ReLU. Mengekstrak relasi geometrik lokal dari tensor 20×20×4 (honest layout — Ch0 Wall, Ch1 Decaying body, Ch2 Static food, Ch3 Dynamic food).
 - **Temporal Attention:** 1 layer Transformer Encoder (_Multi-Head Attention_) di atas 400 sel spasial + 1 learnable `[CLS]` token. Menghitung prioritas lintas-trajektori target dinamis.
 
 ## 2. Baseline Model: DQN 12-bit (Paper Replication)
@@ -101,19 +101,14 @@ def calculate_reward(old_head, new_head, food_eaten, collision):
 ### PPO Spatiotemporal Architecture Diagram
 
 ```
-[Input: Spatiotemporal Tensor v2]
-     Shape: (8, 20, 20)
-  Ch0 Wall          | Ch4  Head dir       (1.0 at cell 1 step in current
-  Ch1 Decaying body |                        direction)
-  Ch2 Static food   | Ch5  Food direction (1.0 at the 4 cells around the
-  Ch3 Dynamic food       head in any direction where SOME food exists;
-        (1.0 current,    mirrors 12-bit obs's Bits 8-11)
-         0.5 previous) | Ch6  Relative danger(1.0 at the 3 cells STRAIGHT /
-                                          LEFT / RIGHT of head — relative
-                                          to current heading — if wall or
-                                          body; "behind" omitted since 180°
-                                          reversal is impossible)
-                    | Ch7  Snake length   (broadcast len/400 everywhere)
+[Input: Spatiotemporal Tensor — honest layout]
+     Shape: (4, 20, 20)
+  Ch0 Wall          (1.0 on the four border rows/cols)
+  Ch1 Decaying body (head=1.0, decays linearly to tail;
+                     extent also implicitly encodes length)
+  Ch2 Static food   (1.0 at each static food cell)
+  Ch3 Dynamic food  (1.0 at current cell, 0.5 at previous —
+                     momentum marker critical on levels 3-4)
              |
              v
 +-----------------------------+
@@ -124,13 +119,14 @@ def calculate_reward(old_head, new_head, food_eaten, collision):
 | - Flatten()                 |
 +-----------------------------+
 
-# Catatan: legacy 4-channel v1 obs (Wall, Body, Static, Dynamic) masih
-# didukung via `obs_type="spatiotemporal_legacy"` agar model lama tidak
-# rusak. Layout v2 menambahkan head direction, food direction, relative
-# danger (3 sel relative to heading), dan snake length di atas 4 ch v1.
-# Ch3 (dynamic food per-cell map dengan 1.0 current + 0.5 previous) adalah
-# sinyal penting untuk level 3-4 yang makanan dinamis adalah satu-satunya
-# target — tanpa channel ini, agen hanya punya directional signal di Ch5.
+# Layout v2 sebelumnya (8 ch dengan head dir, food dir, danger,
+# snake-length broadcast) sudah dihapus — itu semua adalah _heuristic
+# crutches_ yang membuat jaringan membaca jawabannya secara langsung
+# alih-alih mempelajarinya dari geometri mentah. Ch3 (dynamic food
+# per-cell map dengan 1.0 current + 0.5 previous) tetap dipertahankan
+# karena penting untuk level 3-4 di mana makanan dinamis adalah
+# satu-satunya target — tanpa marker momentum ini, agen tidak punya
+# cara mengetahui ke arah mana makanan bergerak.
              |
       [Feature Vector]
              |
@@ -198,8 +194,8 @@ MLP features extractor di-reuse dari `dqn_12bit.py` (3 layer Dense, identik deng
 ### DQN Spatiotemporal Architecture Diagram
 
 ```
-[Input: Spatiotemporal Tensor v2]
-     Shape: (8, 20, 20)
+[Input: Spatiotemporal Tensor — honest layout]
+     Shape: (4, 20, 20)
              |
              v
 +-----------------------------+

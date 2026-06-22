@@ -79,16 +79,21 @@ def _decode_sb3_serialized(blob: str) -> Any:
 def _infer_obs_type_from_shape(shape) -> Optional[str]:
     """Map an SB3 ``observation_space.shape`` to our env's ``obs_type``.
 
-    * ``(8, H, W)``  → ``"spatiotemporal"``        (v2 — current default)
-    * ``(4, H, W)``  → ``"spatiotemporal_legacy"`` (v1 — backward-compat)
+    * ``(4, H, W)``  → ``"spatiotemporal"``        (honest layout — current default;
+                                                     ``spatiotemporal_legacy`` produces
+                                                     the same shape and is disambiguated
+                                                     by the filename-regex fallback)
     * ``(12,)``      → ``"12bit"``
     * else           → ``None`` (unknown)
+
+    Note: the previous v2 layout used an 8-channel ``(8, H, W)`` tensor.
+    Saved models from that era will no longer load — the honest layout
+    is the only supported training obs. Old filenames still resolve
+    correctly via the regex fallback in :func:`_infer_obs_type_from_filename`.
     """
     tup = tuple(int(s) for s in shape)
-    if len(tup) == 3 and tup[0] == 8:
-        return "spatiotemporal"
     if len(tup) == 3 and tup[0] == 4:
-        return "spatiotemporal_legacy"
+        return "spatiotemporal"
     if tup == (12,):
         return "12bit"
     return None
@@ -352,9 +357,9 @@ class input_controller:
         Args:
             obs: Current observation from the env. Shape/type must
                  match the obs space the loaded model was trained on
-                 (e.g., 8×20×20 for "spatiotemporal", 4×20×20 for
-                 "spatiotemporal_legacy", 12-dim for "12bit"). If None,
-                 falls back to a random action.
+                 (4×20×20 for "spatiotemporal" or "spatiotemporal_legacy",
+                 12-dim for "12bit"). If None, falls back to a random
+                 action.
 
         Returns:
             action: Integer 0-3 (UP, RIGHT, DOWN, LEFT)
@@ -422,8 +427,9 @@ class input_controller:
         returned ``obs_type`` — otherwise ``predict()`` will receive a
         tensor of the wrong shape and silently produce garbage actions.
         The legacy 4-channel obs (``"spatiotemporal_legacy"``) is kept
-        so any model trained on the old 4-channel format keeps loading
-        alongside newer 10-channel models.
+        purely so old filenames still resolve correctly via the
+        obs_type-detection regex; both obs types produce the same
+        4-channel honest layout at runtime.
 
         Raises:
             RuntimeError: if the algorithm cannot be determined, the
@@ -456,8 +462,8 @@ class input_controller:
         if obs_type is None:
             raise RuntimeError(
                 f"Unknown observation space shape {meta['obs_shape']!r} in "
-                f"{model_path!r}. Expected spatiotemporal (8,H,W), "
-                f"spatiotemporal_legacy (4,H,W) or 12bit (12,)."
+                f"{model_path!r}. Expected spatiotemporal (4,H,W) or "
+                f"12bit (12,)."
             )
 
         # 2) Dispatch to the correct SB3 loader.

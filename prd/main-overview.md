@@ -1,13 +1,13 @@
 # MAIN PROJECT OVERVIEW
 
 **Project:** Deep Q-Snake vs Spatiotemporal PPO
-**Core Objective:** Membangun agen _Reinforcement Learning_ (RL) berbasis Tensor 8-Kanal dan mekanisme _Attention_ untuk memecahkan _Greedy Trap_ dan melacak target dinamis multi-perilaku. Proyek ini membandingkan arsitektur _Spatiotemporal_ (CNN + Transformer) dengan algoritma _baseline_ DQN 12-bit dari literatur sebelumnya — dan sebaliknya, untuk mengontrol _confounding_ arsitektur vs. algoritma.
+**Core Objective:** Membangun agen _Reinforcement Learning_ (RL) berbasis Tensor 4-Kanal _honest_ dan mekanisme _Attention_ untuk memecahkan _Greedy Trap_ dan melacak target dinamis multi-perilaku. Proyek ini membandingkan arsitektur _Spatiotemporal_ (CNN + Transformer) dengan algoritma _baseline_ DQN 12-bit dari literatur sebelumnya — dan sebaliknya, untuk mengontrol _confounding_ arsitektur vs. algoritma.
 
 ## Sistem Eksekusi Inti
 
 Proyek ini dipisahkan menjadi dua pilar utama:
 
-1. **Game Environment:** Lingkungan kustom berbasis Gymnasium yang mengelola logika spasial matriks, heuristik pergerakan entitas, dan sistem kurikulum bertingkat. Mendukung _dual-outlet_ (8-channel tensor dan 12-bit vector) plus _legacy_ 4-channel tensor untuk backward-compat.
+1. **Game Environment:** Lingkungan kustom berbasis Gymnasium yang mengelola logika spasial matriks, heuristik pergerakan entitas, dan sistem kurikulum bertingkat. Mendukung _dual-outlet_ (4-channel tensor _honest_ dan 12-bit vector). Legacy 4-channel obs tersedia sebagai alias untuk backward-compat dengan model lama.
 2. **Model Training & Evaluation:** Mesin _multiprocessing_ untuk melatih jaringan saraf menggunakan PPO dan DQN — keduanya tersedia dalam dua varian arsitektur (Spatiotemporal CNN+Attention, dan 12-bit MLP). Konfigurasi hyperparameter tersentralisasi di JSON sehingga TUI launcher dan CLI bisa berbagi sumber yang sama.
 
 ## Direktori Proyek
@@ -29,7 +29,7 @@ root/
 │   │   ├── __init__.py
 │   │   ├── game_environment.py # Kelas game_environment (outlet: spatiotemporal,
 │   │   │                        spatiotemporal_legacy, 12bit)
-│   │   ├── config.json         # Konfigurasi env (reward, level, danger flags, dll.)
+│   │   ├── config.json         # Konfigurasi env (reward, level, encircle, dll.)
 │   │   └── ... (renderer, input_controller, ui_components)
 │   │
 │   ├── model/                  # Arsitektur model (4 varian)
@@ -71,7 +71,7 @@ root/
 
 Tabel ini adalah ringkasan _run-of-show_ proyek setelah refactor terbaru. Setiap sel bisa dijalankan dari TUI launcher dengan memilih kombinasi `Algorithm` × `Obs Type` yang sesuai.
 
-| Algorithm ↓ / Obs → | **12bit** (MLP, 12-dim vector)                                 | **spatiotemporal** (CNN+Attention, 8×20×20)                                                                |
+| Algorithm ↓ / Obs → | **12bit** (MLP, 12-dim vector)                                 | **spatiotemporal** (CNN+Attention, 4×20×20 honest layout)                                                  |
 | ------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | **PPO**             | `ppo_12bit.py` — `DQN12BitExtractor` + actor/critic head       | `ppo_spatiotemporal.py` — `SpatiotemporalExtractor` (CNN + Transformer) + actor/critic head                |
 | **DQN**             | `dqn_12bit.py` — `DQN12BitExtractor` + Q-head (baseline paper) | `dqn_spatiotemporal.py` — `SpatiotemporalExtractor` + Q-head (CNN-only ablation via `use_attention=False`) |

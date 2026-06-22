@@ -18,9 +18,8 @@ the features vector and the Q-head, matching the DQN paper baseline
 Pipeline
 --------
     Input tensor (B, C, 20, 20)  — C is read from ``observation_space.shape[0]``
-        │  C=4 (legacy) : (Wall | DecayingBody | StaticFood | DynamicMomentum)
-        │  C=8 (v2)     : 4 above + (HeadDir | FoodDir | RelativeDanger
-        │                 | SnakeLen)
+        │  C=4 (honest layout, current default) : Wall | DecayingBody
+        │                                          | StaticFood | DynamicMomentum
         ▼
     +-----------------------------+
     |  SPATIAL EXTRACTOR (CNN)    |  2 × Conv2d(ReLU)
@@ -44,6 +43,12 @@ Pipeline
         │  one Q-value per discrete action
         ▼
     [argmax(Q)]  →  action ∈ {UP, RIGHT, DOWN, LEFT}
+
+The previous v2 8-channel layout (which included head direction, food
+direction, relative danger, and broadcast snake length as separate
+channels) has been replaced by the 4-channel honest layout — see
+:class:`game.model.ppo_spatiotemporal.SpatiotemporalExtractor` for
+the full rationale.
 
 Why share the SpatiotemporalExtractor with PPO?
 ----------------------------------------------

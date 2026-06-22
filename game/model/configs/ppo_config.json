@@ -28,7 +28,7 @@
   "d_model": 64,
   "n_heads": 4,
   "dropout": 0.1,
-  "use_attention": true,
+  "use_attention": false,
 
   "net_arch_pi": [64],
   "net_arch_vf": [64],
